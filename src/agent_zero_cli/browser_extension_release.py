@@ -81,8 +81,18 @@ MACOS_2_12_1_RELEASE = ApprovedCompanionRelease(
     catalog_sha256="3dcde8e12a571a98d8fe9dfd2c4086469d68e03da9129ee18a63505c834c82b3",
     extension_origins=("chrome-extension://nhliclifilepdkoolioacpjpijomfplj/",),
 )
+MACOS_2_12_2_RELEASE = ApprovedCompanionRelease(
+    version="2.12.2",
+    platform="macos",
+    artifact_arch="universal2",
+    executable_sha256="8cb84de1e66bbd52771b534cb1bfc83d69eb94ebc87b3f7669547bff68359080",
+    executable_size=10_374_256,
+    catalog_key_id="publisher-2026",
+    catalog_sha256="f403678be1077192cc10930f3f1a2a43a55abfdaf0d8ba0615f2780153f046ab",
+    extension_origins=("chrome-extension://nhliclifilepdkoolioacpjpijomfplj/",),
+)
 APPROVED_COMPANION_RELEASES: tuple[ApprovedCompanionRelease, ...] = (
-    MACOS_2_12_0_RELEASE, MACOS_2_12_1_RELEASE,
+    MACOS_2_12_0_RELEASE, MACOS_2_12_1_RELEASE, MACOS_2_12_2_RELEASE,
 )
 
 
