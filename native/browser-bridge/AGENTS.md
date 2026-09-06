@@ -254,7 +254,9 @@
   a future rebuilt binary, signed catalog/provenance verification or runtime
   activation. Genuine independent `publisher-2026` and `builder-2026` public
   roots are provisioned, with exact recipe/toolchain and version URLs under
-  the update/delete-protected `native-v2.12.0-macos-r1` public download tag.
+  the `native-v2.12.0-macos-r2` public download tag, which must be published under
+  the existing update/delete protection before installation. The failed r1
+  distribution remains immutable and is not an installation fallback.
   `RELEASE_SIGNATURE_VERIFIER_READY` denotes the invoked strict Ed25519
   verifier only. Missing/unverified downloads, platform proof, installed
   evidence or Core admission still fail closed. Never use fixture signing keys.
