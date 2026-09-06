@@ -45,6 +45,8 @@ const CORE_HELLO_ACK_ID: u64 = 1;
 const MAX_PACKET: usize = 512 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TICK: Duration = Duration::from_millis(250);
+const COMMAND_BACKPRESSURE_LIMIT: Duration = Duration::from_secs(1);
+const COMMAND_BACKPRESSURE_TICK: Duration = Duration::from_millis(5);
 const MAX_ENGINE_PING_INTERVAL_MS: u64 = 60_000;
 const MAX_ENGINE_PING_TIMEOUT_MS: u64 = 120_000;
 #[cfg(not(feature = "local-development"))]
@@ -78,7 +80,48 @@ enum ConnectError {
     Rejected,
     AuthenticationRejected,
     Expired,
+    CommandBackpressure,
     Stopped,
+}
+
+impl ConnectError {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::Credential => "CORE_CREDENTIAL_UNAVAILABLE",
+            Self::Network => "CORE_NETWORK_FAILED",
+            Self::InvalidChallenge => "CORE_CHALLENGE_INVALID",
+            Self::InvalidPacket => "CORE_PACKET_INVALID",
+            Self::Rejected => "CORE_RUNTIME_REJECTED",
+            Self::AuthenticationRejected => "CORE_AUTHENTICATION_REJECTED",
+            Self::Expired => "CORE_DEADLINE_EXPIRED",
+            Self::CommandBackpressure => "CORE_COMMAND_BACKPRESSURE_EXPIRED",
+            Self::Stopped => "CORE_WORKER_STOPPED",
+        }
+    }
+}
+
+// Retain exactly one already-read packet while the fixed-capacity owner queue
+// drains. No replay, queue growth or unbounded wait; EOF cancellation and live
+// heartbeat/renewal deadlines still win over delivery.
+fn enqueue_command<T>(
+    sender: &SyncSender<T>,
+    mut command: T,
+    stop: &AtomicBool,
+    authority_deadline: Instant,
+) -> Result<(), ConnectError> {
+    let deadline = authority_deadline.min(Instant::now() + COMMAND_BACKPRESSURE_LIMIT);
+    loop {
+        stopped(stop)?;
+        if Instant::now() >= deadline {
+            return Err(ConnectError::CommandBackpressure);
+        }
+        match sender.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(ConnectError::Stopped),
+            Err(mpsc::TrySendError::Full(pending)) => command = pending,
+        }
+        std::thread::sleep(COMMAND_BACKPRESSURE_TICK.min(deadline.saturating_duration_since(Instant::now())));
+    }
 }
 
 #[cfg(feature = "local-development")]
@@ -153,7 +196,12 @@ impl CoreConnection {
                     &channels,
                     worker_profile,
                 );
-                if result.is_err() {
+                if let Err(error) = result {
+                    if !worker_stop.load(Ordering::Acquire) {
+                        // Fixed enum only: never print upstream errors, packets,
+                        // credentials, URLs, paths or request identifiers.
+                        eprintln!("a0-browser-bridge: {}", error.reason_code());
+                    }
                     worker_status.store(
                         if worker_stop.load(Ordering::Acquire) {
                             ConnectionStatus::Stopped
@@ -1032,14 +1080,20 @@ fn serve(
                         .as_ref()
                         .ok_or(ConnectError::InvalidPacket)?
                         .bridge_id();
-                    channels
-                        .commands
-                        .try_send(CoreCommand {
+                    let command_deadline = wire.deadline;
+                    #[cfg(not(feature = "local-development"))]
+                    let command_deadline = wire.refresh_deadline
+                        .map_or(command_deadline, |deadline| command_deadline.min(deadline));
+                    enqueue_command(
+                        &channels.commands,
+                        CoreCommand {
                             packet: packet.to_string(),
                             bridge_id: bridge_id.to_owned(),
                             transport_profile,
-                        })
-                        .map_err(|_| ConnectError::InvalidPacket)?;
+                        },
+                        stop,
+                        command_deadline,
+                    )?;
                     continue;
                 }
                 if let Some(response) = wire.receive(&packet)? {
@@ -1115,6 +1169,41 @@ mod tests {
     use std::net::TcpListener;
 
     const INACTIVE_ACK: &str = "43/ws,1[{\"correlationId\":\"bridge-hello\",\"results\":[{\"handlerId\":\"ws_connector.WsConnector\",\"ok\":true,\"data\":{\"protocol\":\"a0-connector.v1\",\"principal_type\":\"browser_bridge\",\"features\":[],\"connector_session_ready\":false,\"browser_control_ready\":false}}]}]";
+
+    #[test]
+    fn command_backpressure_preserves_burst_fifo_and_bounded_queue() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        for value in 0..8 { sender.try_send(value).unwrap(); }
+        assert!(matches!(sender.try_send(8), Err(mpsc::TrySendError::Full(8))));
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let producer = scope.spawn(|| {
+                for value in 8..32 {
+                    enqueue_command(&sender, value, &stop, Instant::now() + Duration::from_secs(5)).unwrap();
+                }
+            });
+            for expected in 0..32 {
+                assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), expected);
+            }
+            producer.join().unwrap();
+        });
+        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn command_backpressure_never_crosses_stop_or_authority_deadline() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.try_send(1).unwrap();
+        let stopped = AtomicBool::new(true);
+        assert_eq!(enqueue_command(&sender, 2, &stopped, Instant::now() + Duration::from_secs(1)), Err(ConnectError::Stopped));
+        let running = AtomicBool::new(false);
+        assert_eq!(enqueue_command(&sender, 2, &running, Instant::now()), Err(ConnectError::CommandBackpressure));
+        assert_eq!(receiver.try_recv().unwrap(), 1);
+        assert!(matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(receiver);
+        assert_eq!(enqueue_command(&sender, 2, &running, Instant::now() + Duration::from_secs(1)), Err(ConnectError::Stopped));
+        assert_eq!(ConnectError::CommandBackpressure.reason_code(), "CORE_COMMAND_BACKPRESSURE_EXPIRED");
+    }
 
     fn challenge(base: &str, expires: u64) -> Vec<u8> {
         object(&[
