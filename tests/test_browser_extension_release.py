@@ -12,7 +12,9 @@ from agent_zero_cli import browser_extension, browser_extension_release as relea
 
 
 def test_distributed_registry_contains_only_reviewed_mac_executable_and_catalog():
-    assert release.APPROVED_COMPANION_RELEASES == (release.MACOS_2_12_0_RELEASE,)
+    assert release.APPROVED_COMPANION_RELEASES == (
+        release.MACOS_2_12_0_RELEASE, release.MACOS_2_12_1_RELEASE,
+    )
     pin = release.MACOS_2_12_0_RELEASE
     assert release._pin_valid(pin)
     assert (pin.version, pin.platform, pin.artifact_arch) == ("2.12.0", "macos", "universal2")
@@ -21,6 +23,15 @@ def test_distributed_registry_contains_only_reviewed_mac_executable_and_catalog(
     assert pin.catalog_sha256 == "9758f715d7648ee2246c82dc3e9a3574dfc55c07cad24d629166e0cd40ef35e4"
     assert pin.catalog_key_id == "publisher-2026"
     assert pin.extension_origins == ("chrome-extension://nhliclifilepdkoolioacpjpijomfplj/",)
+    newest = release.MACOS_2_12_1_RELEASE
+    assert release._pin_valid(newest)
+    assert (newest.version, newest.platform, newest.artifact_arch) == ("2.12.1", "macos", "universal2")
+    assert newest.executable_sha256 == "26e2bd4ca821b5b2ca7cde5336f1348d682f47855fee705cf43aafd992205890"
+    assert newest.executable_size == 10_374_432
+    assert newest.catalog_sha256 == "3dcde8e12a571a98d8fe9dfd2c4086469d68e03da9129ee18a63505c834c82b3"
+    assert newest.catalog_key_id == pin.catalog_key_id
+    assert newest.extension_origins == pin.extension_origins
+    assert release.MINIMUM_SECURE_COMPANION == "2.12.0"
 
 
 @pytest.fixture

@@ -27,8 +27,11 @@
   digest and archive rejection, redirected download rejection, empty-policy
   no-network behavior, and exact bootstrap-to-native invocation/cleanup order.
   Static provisioned-release assertions additionally bind the actual reviewed
-  corrected Mac 2.12.0 r2 source pins (archive versus executable versus catalog), exact
-  immutable download URL and production origin. Other platforms still select
+  Mac 2.12.1 source pins and retained 2.12.0 r2 pins (archive versus executable versus catalog), exact
+  immutable download URL and production origin; newest compatible selection
+  is independent of registry order.
+  These pins do not raise the independently enforced 2.12.0 secure floor.
+  Other platforms select
   no artifact and perform no download. These tests never fetch, execute or
   install the provisioned companion and are not platform acceptance evidence.
 - `test_browser_extension_release.py` builds only temporary synthetic native

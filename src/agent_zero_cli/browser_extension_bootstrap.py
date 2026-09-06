@@ -34,6 +34,16 @@ class ApprovedBootstrap:
 # This CLI is independently built, so final companion hashes are not circular.
 APPROVED_BOOTSTRAPS: tuple[ApprovedBootstrap, ...] = (
     ApprovedBootstrap(
+        companion=release.MACOS_2_12_1_RELEASE,
+        archive_url=(
+            "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/"
+            "native-v2.12.1-macos-r2/v2.12.1/"
+            "a0-browser-bridge-2.12.1-macos-universal2.tar.gz"
+        ),
+        archive_sha256="5dc1db234c820ecf03119c36f637c6042de33ceee5df88adf8bfb6d037fef4f5",
+        archive_size=4_541_252,
+    ),
+    ApprovedBootstrap(
         companion=release.MACOS_2_12_0_RELEASE,
         archive_url=(
             "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/"

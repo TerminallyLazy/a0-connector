@@ -71,7 +71,19 @@ MACOS_2_12_0_RELEASE = ApprovedCompanionRelease(
     catalog_sha256="9758f715d7648ee2246c82dc3e9a3574dfc55c07cad24d629166e0cd40ef35e4",
     extension_origins=("chrome-extension://nhliclifilepdkoolioacpjpijomfplj/",),
 )
-APPROVED_COMPANION_RELEASES: tuple[ApprovedCompanionRelease, ...] = (MACOS_2_12_0_RELEASE,)
+MACOS_2_12_1_RELEASE = ApprovedCompanionRelease(
+    version="2.12.1",
+    platform="macos",
+    artifact_arch="universal2",
+    executable_sha256="26e2bd4ca821b5b2ca7cde5336f1348d682f47855fee705cf43aafd992205890",
+    executable_size=10_374_432,
+    catalog_key_id="publisher-2026",
+    catalog_sha256="3dcde8e12a571a98d8fe9dfd2c4086469d68e03da9129ee18a63505c834c82b3",
+    extension_origins=("chrome-extension://nhliclifilepdkoolioacpjpijomfplj/",),
+)
+APPROVED_COMPANION_RELEASES: tuple[ApprovedCompanionRelease, ...] = (
+    MACOS_2_12_0_RELEASE, MACOS_2_12_1_RELEASE,
+)
 
 
 class CompanionDiscoveryError(RuntimeError):

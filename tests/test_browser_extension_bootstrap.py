@@ -17,14 +17,20 @@ def test_reviewed_macos_bootstrap_pins_bind_exact_signed_release(monkeypatch):
     monkeypatch.setattr(release, "_host_target", lambda: ("macos", "universal2"))
     pin = bootstrap._select()
     assert pin is not None
-    assert pin.companion is release.MACOS_2_12_0_RELEASE
-    assert pin.archive_sha256 == "f9ca468982794f3a767cdfe2d06f1fc308202d27c7c7d8f383e4a3e108d25482"
-    assert pin.archive_size == 4_546_235
+    assert pin.companion is release.MACOS_2_12_1_RELEASE
+    assert pin.archive_sha256 == "5dc1db234c820ecf03119c36f637c6042de33ceee5df88adf8bfb6d037fef4f5"
+    assert pin.archive_size == 4_541_252
     assert pin.archive_sha256 != pin.companion.executable_sha256
     assert pin.archive_url == (
         "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/"
-        "native-v2.12.0-macos-r2/v2.12.0/a0-browser-bridge-2.12.0-macos-universal2.tar.gz"
+        "native-v2.12.1-macos-r2/v2.12.1/a0-browser-bridge-2.12.1-macos-universal2.tar.gz"
     )
+    # Selection is version-based, not registry order; retain reviewed old pins.
+    monkeypatch.setattr(bootstrap, "APPROVED_BOOTSTRAPS", tuple(reversed(bootstrap.APPROVED_BOOTSTRAPS)))
+    assert bootstrap._select() is pin
+    old = next(item for item in bootstrap.APPROVED_BOOTSTRAPS if item.companion is release.MACOS_2_12_0_RELEASE)
+    assert old.archive_sha256 == "f9ca468982794f3a767cdfe2d06f1fc308202d27c7c7d8f383e4a3e108d25482"
+    assert old.archive_size == 4_546_235
 
 
 @pytest.mark.parametrize("target", [("linux", "x86_64"), ("linux", "aarch64"), ("windows", "x86_64"), None])
