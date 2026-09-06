@@ -14,6 +14,11 @@
 
 ## Security contracts
 
+- Companion 2.12.1 pins the new immutable `native-v2.12.1-macos` release
+  locations for the canonical operation-result decoder repair. The secure
+  compatibility floor remains 2.12.0. New final-byte signing, notarization,
+  publication and installation evidence are required; never overwrite r2 bytes.
+
 - The corrected macOS companion is signed/notarized and published under the
   protected r2 tag with independently pinned CLI bootstrap bytes. Actual native
   Chrome installation and independent CLI installed-state readback passed on
@@ -125,6 +130,13 @@
   redact error message/details. Strip Core-only bridge/load routing fields after
   validation but retain them privately for result correlation. Artifacts remain
   unsupported by this codec.
+  Successful `browser.perform` replies require the canonical exact eight-field
+  protocol §7.3 envelope, including `completed_at_ms` as a positive integral
+  JavaScript-safe timestamp (at most 9007199254740991). Reject missing, malformed
+  or extra fields; preserve exact operation/action correlation. The timestamp
+  is diagnostic only, never freshness or authorization, and is not forwarded
+  into the compatible Core operation-result projection. Seven-field synthetic
+  success fixtures are not a supported alternate protocol.
 - Navigation approval is an exact bound protocol seam. Accept
   `challenge.required` only as a critical notification with non-null
   operation/action IDs, canonical credential-free HTTP(S) origin, lowercase

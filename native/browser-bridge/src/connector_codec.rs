@@ -454,6 +454,7 @@ fn response_data(
                 const KEYS: &[&str] = &[
                     "action_id",
                     "artifacts",
+                    "completed_at_ms",
                     "contract_version",
                     "op_id",
                     "receipts",
@@ -463,9 +464,16 @@ fn response_data(
                 if fields.len() != KEYS.len()
                     || KEYS.iter().any(|key| !fields.contains_key(*key))
                     || fields.get("status").and_then(Value::as_str) != Some("succeeded")
+                    || !fields
+                        .get("completed_at_ms")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|value| (1..=9_007_199_254_740_991).contains(&value))
                 {
                     return Err(CodecError::InvalidResponse);
                 }
+                // Protocol §7.3 requires this extension-local completion timestamp.
+                // It is diagnostic data, not authority/freshness, and is deliberately
+                // absent from the compatible Core operation-result projection.
                 let result = fields
                     .get("result")
                     .filter(|v| v.as_object().is_some())
@@ -1040,6 +1048,46 @@ mod tests {
     }
 
     #[test]
+    fn emitted_operation_success_requires_exact_completion_timestamp_envelope() {
+        let mut packet = json::parse(command("op-open").strip_prefix("42/ws,").unwrap().as_bytes()).unwrap();
+        let Value::Array(ref mut envelope) = packet else { panic!() };
+        let Value::Object(ref mut wrapper) = envelope[1] else { panic!() };
+        let Value::Object(ref mut params) = wrapper.get_mut("data").unwrap() else { panic!() };
+        params.insert("action".into(), Value::String("open".into()));
+        params.insert("target".into(), Value::Null);
+        params.insert("args".into(), json::parse(br#"{"url":"https://example.test/"}"#).unwrap());
+        params.insert("required_capabilities".into(), json::parse(br#"["open","tab_leases_v1","tab_groups_v1"]"#).unwrap());
+        let command = format!("42/ws,{}", packet.encode());
+        let mut codec = ConnectorCodec::new("generation-1".into());
+        let native = codec.command(&command, "bridge-1").unwrap();
+        let RpcMessage::Request(request) = rpc::parse_message(&native, Peer::Server).unwrap() else { panic!() };
+        // Exact operationSuccess envelope emitted by the extension after open.
+        let valid = format!(
+            r#"{{"jsonrpc":"2.0","id":"{}","result":{{"contract_version":1,"op_id":"op-open","action_id":"action-1","status":"succeeded","result":{{"lease_id":"lease-1","browser_id":"a0t1.generation-1.lease-1","tab_handle":"a0t1.generation-1.lease-1"}},"receipts":[],"artifacts":[],"completed_at_ms":1788492445123}}}}"#,
+            request.id.unwrap()
+        );
+        for invalid in ["0", "-1", "1.5", "1e3", "9007199254740992", "null", "true", "\"1788492445123\"", "{}"] {
+            assert_eq!(codec.response(valid.replace("1788492445123", invalid).as_bytes()), Err(CodecError::InvalidResponse), "accepted timestamp {invalid}");
+        }
+        for invalid in [
+            valid.replace(",\"completed_at_ms\":1788492445123", ""),
+            valid.replace("\"completed_at_ms\":1788492445123", "\"completed_at_ms\":1788492445123,\"unexpected\":true"),
+            valid.replace("\"op_id\":\"op-open\"", "\"op_id\":\"other-op\""),
+            valid.replace("\"action_id\":\"action-1\"", "\"action_id\":\"other-action\""),
+        ] {
+            assert_eq!(codec.response(invalid.as_bytes()), Err(CodecError::InvalidResponse));
+        }
+        let forwarded = codec.response(valid.as_bytes()).unwrap();
+        assert!(forwarded.contains("connector_browser_op_result"));
+        assert!(forwarded.contains("\"ok\":true"));
+        assert!(forwarded.contains("\"op_id\":\"op-open\""));
+        assert!(forwarded.contains("\"action_id\":\"action-1\""));
+        assert!(forwarded.contains("\"bridge_id\":\"bridge-1\""));
+        assert!(!forwarded.contains("completed_at_ms"));
+        assert!(!forwarded.contains("1788492445123"));
+    }
+
+    #[test]
     fn operation_roundtrip_preserves_request_identity_and_redacts_errors() {
         let mut codec = ConnectorCodec::new("generation-1".into());
         let native = codec.command(&command("op-1"), "bridge-1").unwrap();
@@ -1068,8 +1116,15 @@ mod tests {
         let production = BrowserTransportProfile::fixture_production();
         let development = BrowserTransportProfile::fixture_development();
         let production_packet = command("op-profile-production");
-        let development_packet =
-            production_packet.replace(production.handler_id(), development.handler_id());
+        // Direction isolation needs an otherwise admitted development action;
+        // semantic click/trusted input are intentionally production-only.
+        let development_packet = production_packet
+            .replace(production.handler_id(), development.handler_id())
+            .replace("\"action\":\"click\"", "\"action\":\"open\"")
+            .replace(
+                "\"required_capabilities\":[\"click\",\"semantic_dom_v1\",\"cursor_v1\",\"trusted_input_v1\"]",
+                "\"required_capabilities\":[\"open\"]",
+            );
 
         let mut production_codec = ConnectorCodec::with_profile("generation-1".into(), production);
         assert_eq!(
@@ -1401,7 +1456,7 @@ mod tests {
                 "\"tab_handle\":\"a0t1.fixture-generation.fixture-lease\",",
                 "\"document_epoch\":\"1\",\"ref\":\"frame0:node24\",",
                 "\"action_class\":\"sensitive_input\"}},",
-                "\"receipts\":[],\"artifacts\":[]}}}}"
+                "\"receipts\":[],\"artifacts\":[],\"completed_at_ms\":1788492445123}}}}"
             ),
             native_id = native_id,
         );
@@ -1464,7 +1519,7 @@ mod tests {
                 "\"browser_id\":\"a0t1.fixture-generation.fixture-lease\",",
                 "\"tab_handle\":\"a0t1.fixture-generation.fixture-lease\",",
                 "\"document_epoch\":\"1\",\"ref\":\"frame0:node24\",",
-                "\"action_class\":\"unknown\"}},\"receipts\":[],\"artifacts\":[]}}}}"
+                "\"action_class\":\"unknown\"}},\"receipts\":[],\"artifacts\":[],\"completed_at_ms\":1788492445123}}}}"
             ),
             native_id = native_id,
         );
