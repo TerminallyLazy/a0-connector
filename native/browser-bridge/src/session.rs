@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use crate::artifact::ArtifactRoute;
 use crate::artifact_codec::{ArtifactCodec, ArtifactCodecError};
@@ -138,6 +138,7 @@ pub struct RelaySession {
     server_ready: bool,
     pairing: Arc<PairingService>,
     core_connection: Option<CoreConnection>,
+    native_input_closed: Arc<AtomicBool>,
     core_connect_requested: bool,
     core_codec: Option<ConnectorCodec>,
     artifact_codec: Option<ArtifactCodec>,
@@ -186,6 +187,7 @@ impl RelaySession {
             server_ready,
             pairing: Arc::new(pairing),
             core_connection: None,
+            native_input_closed: Arc::new(AtomicBool::new(false)),
             core_connect_requested: false,
             core_codec: None,
             artifact_codec: None,
@@ -205,6 +207,10 @@ impl RelaySession {
 
     pub const fn state(&self) -> SessionState {
         self.state
+    }
+
+    pub(crate) fn native_input_closed_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.native_input_closed)
     }
 
     pub fn caller_origin(&self) -> &str {
@@ -531,6 +537,7 @@ impl RelaySession {
             self.core_connection = Some(CoreConnection::start(
                 Arc::clone(&self.pairing),
                 extension_hello,
+                Arc::clone(&self.native_input_closed),
             ));
         }
     }

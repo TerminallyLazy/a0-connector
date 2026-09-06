@@ -145,11 +145,14 @@ pub(crate) struct CoreConnection {
     development_route: Arc<Mutex<Option<DevelopmentRuntimeRoute>>>,
     commands: Receiver<CoreCommand>,
     results: SyncSender<String>,
+    result_deadline: Arc<Mutex<Instant>>,
+    native_input_closed: Arc<AtomicBool>,
 }
 
 struct WorkerChannels {
     commands: SyncSender<CoreCommand>,
     results: Receiver<String>,
+    result_deadline: Arc<Mutex<Instant>>,
 }
 
 pub(crate) struct CoreCommand {
@@ -163,14 +166,17 @@ impl CoreConnection {
     pub(crate) fn start(
         pairing: Arc<PairingService>,
         extension_hello: ExtensionRuntimeHello,
+        native_input_closed: Arc<AtomicBool>,
     ) -> Self {
         let transport_profile = BrowserTransportProfile::compiled();
         let worker_profile = transport_profile;
         let (command_sender, commands) = mpsc::sync_channel(8);
         let (results, result_receiver) = mpsc::sync_channel(8);
+        let result_deadline = Arc::new(Mutex::new(Instant::now()));
         let channels = WorkerChannels {
             commands: command_sender,
             results: result_receiver,
+            result_deadline: Arc::clone(&result_deadline),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let status = Arc::new(AtomicU8::new(ConnectionStatus::Connecting as u8));
@@ -226,6 +232,8 @@ impl CoreConnection {
             development_route,
             commands,
             results,
+            result_deadline,
+            native_input_closed,
         }
     }
 
@@ -233,12 +241,34 @@ impl CoreConnection {
         self.commands.try_recv().ok()
     }
 
-    pub(crate) fn send_result(&self, packet: String) -> Result<(), ()> {
+    pub(crate) fn send_result(&self, mut packet: String) -> Result<(), ()> {
         if packet.len() > MAX_PACKET || self.status() != ConnectionStatus::Ready {
             return Err(());
         }
-        // Full queues fail closed rather than blocking native control/EOF.
-        self.results.try_send(packet).map_err(|_| ())
+        // The single owning producer retains one packet while the worker drains
+        // the same fixed queue. Admission/EOF always wins over delivery; neither
+        // a successful enqueue nor a wait grants fresh runtime authority.
+        let deadline = Instant::now() + COMMAND_BACKPRESSURE_LIMIT;
+        loop {
+            if self.stop.load(Ordering::Acquire)
+                || self.native_input_closed.load(Ordering::Acquire)
+                || self.status() != ConnectionStatus::Ready
+            {
+                return Err(());
+            }
+            let authority_deadline = *self.result_deadline.lock().map_err(|_| ())?;
+            let remaining = deadline.min(authority_deadline).saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                eprintln!("a0-browser-bridge: CORE_RESULT_BACKPRESSURE_EXPIRED");
+                return Err(());
+            }
+            match self.results.try_send(packet) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Disconnected(_)) => return Err(()),
+                Err(mpsc::TrySendError::Full(pending)) => packet = pending,
+            }
+            std::thread::sleep(COMMAND_BACKPRESSURE_TICK.min(remaining));
+        }
     }
 
     pub(crate) fn status(&self) -> ConnectionStatus {
@@ -308,6 +338,8 @@ impl CoreConnection {
             development_route: Arc::new(Mutex::new(None)),
             commands,
             results,
+            result_deadline: Arc::new(Mutex::new(Instant::now() + Duration::from_secs(60))),
+            native_input_closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1041,6 +1073,7 @@ fn serve(
                 .send(Message::Text(packet.into()))
                 .map_err(|_| ConnectError::Network)?;
         }
+        publish_result_deadline(channels, &wire)?;
         if wire.phase == Phase::Connected {
             if status.load(Ordering::Acquire) == ConnectionStatus::Ready as u8 {
                 let channels = channels.ok_or(ConnectError::InvalidPacket)?;
@@ -1109,6 +1142,7 @@ fn serve(
                     );
                 }
                 if wire.phase == Phase::Connected {
+                    publish_result_deadline(channels, &wire)?;
                     #[cfg(not(feature = "local-development"))]
                     if status.load(Ordering::Acquire) != ConnectionStatus::Ready as u8 {
                         let route = wire
@@ -1162,6 +1196,16 @@ fn serve(
     }
 }
 
+fn publish_result_deadline(channels: Option<&WorkerChannels>, wire: &Wire) -> Result<(), ConnectError> {
+    if let Some(channels) = channels {
+        let deadline = wire.deadline;
+        #[cfg(not(feature = "local-development"))]
+        let deadline = wire.refresh_deadline.map_or(deadline, |refresh| deadline.min(refresh));
+        *channels.result_deadline.lock().map_err(|_| ConnectError::InvalidPacket)? = deadline;
+    }
+    Ok(())
+}
+
 #[cfg(all(test, not(feature = "local-development")))]
 mod tests {
     use super::*;
@@ -1169,6 +1213,68 @@ mod tests {
     use std::net::TcpListener;
 
     const INACTIVE_ACK: &str = "43/ws,1[{\"correlationId\":\"bridge-hello\",\"results\":[{\"handlerId\":\"ws_connector.WsConnector\",\"ok\":true,\"data\":{\"protocol\":\"a0-connector.v1\",\"principal_type\":\"browser_bridge\",\"features\":[],\"connector_session_ready\":false,\"browser_control_ready\":false}}]}]";
+
+    #[test]
+    fn result_backpressure_preserves_reconcile_and_critical_event_burst() {
+        let mut connection = CoreConnection::fixture(ConnectionStatus::Ready, None);
+        let (sender, receiver) = mpsc::sync_channel(8);
+        connection.results = sender;
+        let packets: Vec<String> = (0..24).map(|index| format!(
+            "42/ws,[\"{}\",{{\"fixture_sequence\":{index}}}]",
+            if index == 0 { "browser_bridge_control_result" } else { "browser_bridge_event" },
+        )).collect();
+        for packet in &packets[..8] { connection.send_result(packet.clone()).unwrap(); }
+        let remaining = packets[8..].to_vec();
+        let (finished, completion) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let result = remaining.into_iter().try_for_each(|packet| connection.send_result(packet));
+                finished.send(result).unwrap();
+            });
+            // The worker deliberately has not drained any of its eight slots.
+            // The ninth valid packet must wait, not terminate the native port.
+            assert_eq!(completion.recv_timeout(Duration::from_millis(30)), Err(mpsc::RecvTimeoutError::Timeout));
+            for packet in packets {
+                assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(), packet);
+            }
+            assert_eq!(completion.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn result_backpressure_cancels_on_eof_stop_status_or_authority_expiry() {
+        for cancellation in 0..4 {
+            let mut connection = CoreConnection::fixture(ConnectionStatus::Ready, None);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            connection.results = sender;
+            connection.send_result("first".into()).unwrap();
+            let stop = Arc::clone(&connection.stop);
+            let input_closed = Arc::clone(&connection.native_input_closed);
+            let status = Arc::clone(&connection.status);
+            let deadline = Arc::clone(&connection.result_deadline);
+            let (finished, completion) = mpsc::channel();
+            std::thread::scope(|scope| {
+                scope.spawn(move || finished.send(connection.send_result("second".into())).unwrap());
+                assert_eq!(completion.recv_timeout(Duration::from_millis(15)), Err(mpsc::RecvTimeoutError::Timeout));
+                match cancellation {
+                    0 => input_closed.store(true, Ordering::Release),
+                    1 => stop.store(true, Ordering::Release),
+                    2 => status.store(ConnectionStatus::Failed as u8, Ordering::Release),
+                    _ => *deadline.lock().unwrap() = Instant::now(),
+                }
+                assert_eq!(completion.recv_timeout(Duration::from_millis(200)).unwrap(), Err(()));
+            });
+            assert_eq!(receiver.recv().unwrap(), "first");
+            assert!(receiver.try_recv().is_err());
+        }
+        let mut connection = CoreConnection::fixture(ConnectionStatus::Ready, None);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        connection.results = sender;
+        assert!(connection.send_result("x".repeat(MAX_PACKET + 1)).is_err());
+        assert!(receiver.try_recv().is_err());
+        drop(receiver);
+        assert!(connection.send_result("disconnected".into()).is_err());
+    }
 
     #[test]
     fn command_backpressure_preserves_burst_fifo_and_bounded_queue() {
@@ -1489,6 +1595,7 @@ mod tests {
         let channels = WorkerChannels {
             commands: command_sender,
             results,
+            result_deadline: Arc::new(Mutex::new(Instant::now())),
         };
         let relay = std::thread::spawn(move || {
             let command: CoreCommand = commands.recv_timeout(Duration::from_secs(5)).unwrap();

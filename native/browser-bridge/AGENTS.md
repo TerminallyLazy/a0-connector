@@ -14,8 +14,9 @@
 
 ## Security contracts
 
-- Companion 2.12.2 pins the new immutable `native-v2.12.2-macos` release
-  locations for bounded message-burst backpressure and fixed-code diagnostics. The secure
+- Companion 2.12.3 pins the new immutable `native-v2.12.3-macos` release
+  locations for bounded outbound result/event backpressure and clean-EOF
+  cancellation in addition to the earlier inbound queue correction. The secure
   compatibility floor remains 2.12.0. New final-byte signing, notarization,
   publication and installation evidence are required; never overwrite r2 bytes.
 
@@ -103,6 +104,15 @@
   admission extension or blocking native EOF is allowed. Exhaustion still
   closes the worker. Worker failures emit only a fixed enum-derived stderr
   category; never upstream error text or packet/identity/credential data.
+  The opposite-direction eight-packet result/event queue also retains just one
+  pending packet with at most one second of FIFO backpressure. Every five
+  milliseconds recheck worker status, cancellation and the worker-published
+  current Engine.IO/pending-renewal deadline; readiness never comes from queue
+  acceptance. Native input clean EOF independently cancels this owner-thread
+  wait, and remains a successful port close. Exhaustion emits only fixed
+  `CORE_RESULT_BACKPRESSURE_EXPIRED` and closes the session; it never resends an
+  operation, grows a queue, or claims effects were not applied. Reconciliation
+  results followed by recovered critical events share this same bounded FIFO.
   DNS/credential calls are worker-local; cancellation
   is checked between network phases and normal socket reads use a short timeout.
   Native EOF/disconnect must not wait for OS DNS or credential operations.

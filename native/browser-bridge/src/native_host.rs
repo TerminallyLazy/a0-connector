@@ -5,6 +5,7 @@
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{atomic::Ordering, Arc};
 use std::time::{Duration, Instant};
 
 use crate::manifest::is_exact_extension_origin;
@@ -199,19 +200,26 @@ pub fn run_native_session<R: Read + Send + 'static, W: Write>(
     // One queued frame bounds memory and preserves backpressure. Never join on
     // shutdown: an OS pipe read may remain blocked until the process exits.
     let (input, frames) = mpsc::sync_channel(1);
+    let started = Instant::now();
+    let mut session = RelaySession::from_validated_invocation(invocation, 0);
+    let input_closed = session.native_input_closed_signal();
+    let reader_closed = Arc::clone(&input_closed);
     std::thread::Builder::new()
         .name("a0-native-input".into())
         .spawn(move || loop {
             let frame = read_frame(&mut reader);
             let terminal = frame.is_err();
+            if matches!(&frame, Err(FrameError::Closed)) {
+                // Wake a bounded outbound-queue wait without waiting for the
+                // owner to consume the queued EOF. This grants no new effects.
+                reader_closed.store(true, Ordering::Release);
+            }
             if input.send(frame).is_err() || terminal {
                 break;
             }
         })
         .map_err(FrameError::Io)?;
-    let started = Instant::now();
-    let mut session = RelaySession::from_validated_invocation(invocation, 0);
-    loop {
+    let outcome = (|| loop {
         let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let expired = session.expire(now_ms).map_err(FrameError::Protocol)?;
         route_messages(&mut session, writer, expired)?;
@@ -235,7 +243,14 @@ pub fn run_native_session<R: Read + Send + 'static, W: Write>(
         if session.state() == SessionState::Blocked {
             return Ok(());
         }
+    })();
+    if input_closed.load(Ordering::Acquire)
+        && matches!(&outcome, Err(FrameError::Protocol(SessionError::ConnectorUnavailable)))
+    {
+        session.close();
+        return Ok(());
     }
+    outcome
 }
 
 fn route_messages<W: Write>(

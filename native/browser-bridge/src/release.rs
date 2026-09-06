@@ -45,9 +45,9 @@ pub struct PinnedReleaseCatalog {
 }
 
 pub const PINNED_RELEASE_CATALOGS: &[PinnedReleaseCatalog] = &[PinnedReleaseCatalog {
-    release: "2.12.2",
-    catalog_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.2-macos/catalog.json",
-    signature_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.2-macos/catalog.sig",
+    release: "2.12.3",
+    catalog_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.3-macos/catalog.json",
+    signature_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.3-macos/catalog.sig",
 }];
 
 /// Immutable detached derivation receipts, signed after the payload/catalog.
@@ -63,11 +63,11 @@ pub struct PinnedBuildProvenance {
 }
 
 pub const PINNED_BUILD_PROVENANCE: &[PinnedBuildProvenance] = &[PinnedBuildProvenance {
-    release: "2.12.2",
+    release: "2.12.3",
     platform: "macos",
     artifact_arch: "universal2",
-    statement_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.2-macos/provenance-macos-universal2.json",
-    signature_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.2-macos/provenance-macos-universal2.sig",
+    statement_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.3-macos/provenance-macos-universal2.json",
+    signature_url: "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.3-macos/provenance-macos-universal2.sig",
 }];
 
 /// Optional independently provisioned local-release provenance signers. Catalog
