@@ -27,7 +27,8 @@
   digest and archive rejection, redirected download rejection, empty-policy
   no-network behavior, and exact bootstrap-to-native invocation/cleanup order.
   Static provisioned-release assertions additionally bind the actual reviewed
-  Mac 2.12.2 source pins and retained 2.12.0/2.12.1 r2 pins (archive versus executable versus catalog), exact
+  Mac 2.12.3 source pins and retained 2.12.0/2.12.1 r2 and 2.12.2 pins
+  (archive versus executable versus catalog), exact
   immutable download URL and production origin; newest compatible selection
   is independent of registry order.
   These pins do not raise the independently enforced 2.12.0 secure floor.

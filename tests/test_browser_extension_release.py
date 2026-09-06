@@ -13,7 +13,8 @@ from agent_zero_cli import browser_extension, browser_extension_release as relea
 
 def test_distributed_registry_contains_only_reviewed_mac_executable_and_catalog():
     assert release.APPROVED_COMPANION_RELEASES == (
-        release.MACOS_2_12_0_RELEASE, release.MACOS_2_12_1_RELEASE, release.MACOS_2_12_2_RELEASE,
+        release.MACOS_2_12_0_RELEASE, release.MACOS_2_12_1_RELEASE,
+        release.MACOS_2_12_2_RELEASE, release.MACOS_2_12_3_RELEASE,
     )
     pin = release.MACOS_2_12_0_RELEASE
     assert release._pin_valid(pin)
@@ -38,6 +39,14 @@ def test_distributed_registry_contains_only_reviewed_mac_executable_and_catalog(
     assert newest.executable_sha256 == "8cb84de1e66bbd52771b534cb1bfc83d69eb94ebc87b3f7669547bff68359080"
     assert newest.executable_size == 10_374_256
     assert newest.catalog_sha256 == "f403678be1077192cc10930f3f1a2a43a55abfdaf0d8ba0615f2780153f046ab"
+    assert newest.catalog_key_id == pin.catalog_key_id
+    assert newest.extension_origins == pin.extension_origins
+    newest = release.MACOS_2_12_3_RELEASE
+    assert release._pin_valid(newest)
+    assert (newest.version, newest.platform, newest.artifact_arch) == ("2.12.3", "macos", "universal2")
+    assert newest.executable_sha256 == "803a24e87f2568c5fbb1c9f5de400bd3b8aab60a16a6ac70f3814be4494f482b"
+    assert newest.executable_size == 10_376_528
+    assert newest.catalog_sha256 == "a40176dcd2048e692996b3ba4f5bf5218fe5ab98fca085f85eaa6cbe9a9ebd29"
     assert newest.catalog_key_id == pin.catalog_key_id
     assert newest.extension_origins == pin.extension_origins
 

@@ -58,7 +58,8 @@
   catalog/platform/provenance/derived-executable release evidence. It currently
   retains the reviewed 2.12.0 macOS universal2 release and adds the signed,
   notarized 2.12.1 operation-result decoder correction and 2.12.2 bounded
-  command-backpressure correction, using catalog key
+  command-backpressure correction, plus 2.12.3 bounded outbound result/event
+  backpressure with independent native EOF cancellation, using catalog key
   `publisher-2026`, and exact production extension origin. These are installed executable hashes,
   not compressed catalog payload hashes. No server, environment, file, PATH,
   self-report, or runtime flag may supply approved pins. Derive the per-user
@@ -94,8 +95,8 @@
   registration/installation mutation. Empty bootstrap pins perform no network
   request. Timeouts report unknown final state, not successful rollback.
   The newest provisioned Mac bootstrap pins the immutable
-  `native-v2.12.2-macos/v2.12.2` payload and its final archive and executable
-  digests independently. Preserve the older reviewed 2.12.0/2.12.1 r2 pins for installed
+  `native-v2.12.3-macos/v2.12.3` payload and its final archive and executable
+  digests independently. Preserve the older reviewed 2.12.0/2.12.1 r2 and 2.12.2 pins for installed
   discovery; bootstrap always selects the newest compatible compiled version,
   regardless of tuple order, without retrying an older release after failure.
   The incomplete `native-v2.12.1-macos` publication is not a bootstrap source.
@@ -104,7 +105,7 @@
   public artifact readback precedes installation acceptance. Rebuilding the
   ordinary CLI wheel includes these source pins without additional dependencies;
   already installed CLI copies and previously built wheels remain unchanged.
-  Final 2.12.2 local artifacts, notarization and signed metadata are verified;
+  Final 2.12.3 local artifacts, notarization and signed metadata are verified;
   public readback and installed/runtime acceptance remain separate evidence.
   The older corrected r2 artifact has passed actual native Chrome installation and
   independent source-CLI installed-state verification on the signing host.
