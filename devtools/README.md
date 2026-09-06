@@ -28,10 +28,10 @@ This preserves runtime dependency versions; it does not install/update the
 separately registered native companion or modify its paired identity. Fresh
 environments still need the package's pinned runtime dependencies.
 
-An A0 wheel is not a signed native release. Stable fresh-host bootstrap and
-CLI pairing require their separate release/server integration; the usable
-explicit-source path is `a0 browser-extension development install|update
---source-binary /absolute/a0-browser-bridge --yes`, followed by extension pairing.
+An A0 wheel is not a signed native release. Its Mac bootstrap independently pins
+the signed/notarized r2 companion, while Chrome pairing still requires the
+matching Agent Zero server. The explicit-source development commands remain
+separate and never substitute for production release trust.
 
 ## Prerequisites
 

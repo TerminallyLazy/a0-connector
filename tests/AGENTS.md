@@ -27,7 +27,7 @@
   digest and archive rejection, redirected download rejection, empty-policy
   no-network behavior, and exact bootstrap-to-native invocation/cleanup order.
   Static provisioned-release assertions additionally bind the actual reviewed
-  Mac 2.12.0 source pins (archive versus executable versus catalog), exact
+  corrected Mac 2.12.0 r2 source pins (archive versus executable versus catalog), exact
   immutable download URL and production origin. Other platforms still select
   no artifact and perform no download. These tests never fetch, execute or
   install the provisioned companion and are not platform acceptance evidence.

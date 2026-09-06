@@ -37,11 +37,11 @@ APPROVED_BOOTSTRAPS: tuple[ApprovedBootstrap, ...] = (
         companion=release.MACOS_2_12_0_RELEASE,
         archive_url=(
             "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/"
-            "native-v2.12.0-macos-r1/v2.12.0/"
+            "native-v2.12.0-macos-r2/v2.12.0/"
             "a0-browser-bridge-2.12.0-macos-universal2.tar.gz"
         ),
-        archive_sha256="5c5e91d969982639bd80f273457584f8dc3b2ca88274990eb01bb0b0836ca8e2",
-        archive_size=4_545_324,
+        archive_sha256="f9ca468982794f3a767cdfe2d06f1fc308202d27c7c7d8f383e4a3e108d25482",
+        archive_size=4_546_235,
     ),
 )
 _LIMIT = 512 * 1024 * 1024

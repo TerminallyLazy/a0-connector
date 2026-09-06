@@ -8,13 +8,13 @@ This subtree is the foundation for the standalone
 - a Unix install/update transaction engine requiring an opaque verified
   candidate, with concrete macOS acquisition and CLI installation composition.
 
-**Draft release gate:** the macOS CodeDirectory parser is corrected in source,
-but the separately distributed CLI still pins the earlier
-`native-v2.12.0-macos-r1` artifact. That binary rejects candidate composition
-before installation; it must not be advertised as a working installer. A new
-immutable signed/notarized release, refreshed CLI pins and successful installed
-state readback are pending. The corrected source passed actual-public candidate
-verification in isolated staging without invoking the installation transaction.
+**macOS release status:** the corrected companion is published under protected
+immutable tag `native-v2.12.0-macos-r2`, with Developer ID signing, notarization
+and independent CLI final-byte pins. Actual native Chrome installation and
+independent CLI installed-state verification passed on the signing host.
+The failed r1 distribution remains immutable and is not a fallback. Live Chrome
+pairing/control, Chrome Web Store approval and other platform acceptance remain
+separate gates.
 
 The reviewed release policy contains genuine publisher/builder public roots,
 immutable catalog locations and the reviewed production extension origin.
@@ -27,7 +27,7 @@ publisher/builder roots and published macOS release assets are provisioned.
 Native macOS install/update acquires the compiled immutable release,
 verifies it and invokes the transaction; metadata alone never enables installation.
 The separate Python CLI fresh-host bootstrap independently pins final bytes;
-its pending corrected-artifact update is part of the release gate above.
+it now selects the corrected r2 artifact.
 Key identifiers alone cannot enable readiness; no fixture identity or signing
 root is included in production policy.
 
@@ -75,9 +75,9 @@ a0-browser-bridge update [--json]
 ```
 
 `install` and `update` reject missing or invalid release evidence before mutation.
-The currently pinned earlier macOS artifact returns
-`VERIFIED_INSTALL_CANDIDATE_INVALID`; do not confuse public signature verification
-with successful installation. Native-host caller origins are validated before
+The corrected r2 macOS install returned `INSTALL_VERIFIED` with one registered
+Chrome target, followed by independent CLI verification. Do not generalize that
+host result to other platforms. Native-host caller origins are validated before
 stdin is read; unapproved origins receive a bounded stderr reason and no stdout
 bytes. A
 clean native port close exits `0`; malformed framing (empty, truncated, or over

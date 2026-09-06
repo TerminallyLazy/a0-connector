@@ -97,13 +97,12 @@ For advanced cases you can override the interpreter request with
 
 ## Browser extension companion
 
-> Draft integration: do not ship this snapshot as a working production installer.
-> The macOS source includes the corrected CodeDirectory signature parser, but
-> the CLI still pins the earlier `native-v2.12.0-macos-r1` artifact, whose install
-> attempt rejects the verified candidate before mutation. A freshly signed and
-> notarized immutable release, refreshed CLI pins, and successful installation
-> readback are required before release. Linux delivery/acceptance and Windows
-> candidate verification/installation remain incomplete.
+> macOS 2.12.0 is published under the protected `native-v2.12.0-macos-r2`
+> release tag with Developer ID signing, notarization and independently pinned
+> CLI bootstrap bytes. Native Chrome installation and independent CLI installed
+> status readback have passed on the signing host. Chrome pairing/control and
+> Chrome Web Store approval are separate gates; Linux delivery/acceptance and
+> Windows candidate verification/installation remain incomplete.
 
 The Browser Bridge is a separate native companion installed for the current OS
 user on the computer that runs Chrome, Edge, Brave, Vivaldi, Opera, or Chromium.
@@ -121,10 +120,10 @@ a0 browser-extension uninstall --yes
 ```
 
 Reviewed production identities, independent publisher/builder public roots and
-signed macOS artifacts exist, but the corrected release gate above is pending. The
+signed/notarized macOS artifacts are published. The
 fresh-host CLI bootstrap now acquires only independently pinned archive and
 executable bytes, then invokes the concrete macOS native verification/installer
-path. Delivery wrappers and platform adapters still need their release evidence.
+path. Linux and Windows still need their separate delivery/platform evidence.
 It never treats a
 same-name executable found on `PATH` as trusted and never falls back to an
 unchecked download. The native companion now owns transactional Ed25519 pairing

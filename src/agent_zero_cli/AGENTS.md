@@ -52,7 +52,7 @@
   for the current profile and persists through Core's `agent_editor` API.
 - Clipboard image paste uses `wl-paste` or `xclip` on Linux and the conditionally installed Pillow native reader on macOS and Windows.
 - The CLI may remember host/context and computer-use settings, and protected web sessions may persist browser-style session cookies through the remembered-host/session flow. It may consume ephemeral `A0_USERNAME` and `A0_PASSWORD` environment variables for non-interactive login, but it must not persist usernames, passwords, connector tokens, API keys, or other secrets.
-- `a0 browser-extension install|status|doctor|pair|repair|update|uninstall` is a Textual-free orchestration surface for the standalone `a0-browser-bridge`; Python must not duplicate native registration/install logic. The command family, immutable install-state resolver and fresh-host bootstrap are wired, but production use remains blocked until reviewed pinned roots/assets exist. It never trusts a same-name PATH executable or downloads an unchecked asset. Companion stdout/stderr are read concurrently into fixed caps and the child is terminated on overflow; human stdout is forwarded only after the bounded process completes. Explicit human `pair` requires an interactive terminal, approved extension identity, authenticated/CSRF session and `browser_bridge_pairing_v1`; it creates exactly one Core trust-v1 intent and shows the code once for Chrome Options. Chrome retains profile/install authority and performs the native exchange. Never invoke an unsupported native CLI pair command or put pairing material in argv, environment, files, generic logs, URLs or JSON. JSON/redirected pairing creates no secret and returns action-required. Validate the exact bounded response, host, identity and five-minute lifetime; never retry an ambiguous creation POST or claim paired before Chrome confirms. Resolve server status independently of local companion state from explicit, saved, then default host; restore and verify the browser-style session before calling authenticated/CSRF-protected `_browser/status`, expose only an allowlisted extension-foundation projection, and label an unavailable endpoint `not_checked`. Machine output is exactly one `a0.browser-extension.cli.v1` object, accepts only exact companion v1 result contracts (including independently verified installed status), redacts private paths/secrets, and preserves exit meanings `0`, `2` through `7` from the frozen install contract.
+- `a0 browser-extension install|status|doctor|pair|repair|update|uninstall` is a Textual-free orchestration surface for the standalone `a0-browser-bridge`; Python must not duplicate native registration/install logic. The command family, immutable install-state resolver and fresh-host bootstrap are wired with the reviewed corrected Mac r2 release; unprovisioned or unverified platforms remain unavailable. It never trusts a same-name PATH executable or downloads an unchecked asset. Companion stdout/stderr are read concurrently into fixed caps and the child is terminated on overflow; human stdout is forwarded only after the bounded process completes. Explicit human `pair` requires an interactive terminal, approved extension identity, authenticated/CSRF session and `browser_bridge_pairing_v1`; it creates exactly one Core trust-v1 intent and shows the code once for Chrome Options. Chrome retains profile/install authority and performs the native exchange. Never invoke an unsupported native CLI pair command or put pairing material in argv, environment, files, generic logs, URLs or JSON. JSON/redirected pairing creates no secret and returns action-required. Validate the exact bounded response, host, identity and five-minute lifetime; never retry an ambiguous creation POST or claim paired before Chrome confirms. Resolve server status independently of local companion state from explicit, saved, then default host; restore and verify the browser-style session before calling authenticated/CSRF-protected `_browser/status`, expose only an allowlisted extension-foundation projection, and label an unavailable endpoint `not_checked`. Machine output is exactly one `a0.browser-extension.cli.v1` object, accepts only exact companion v1 result contracts (including independently verified installed status), redacts private paths/secrets, and preserves exit meanings `0`, `2` through `7` from the frozen install contract.
 - `browser_extension_release.py` owns read-only stable companion discovery. Its
   compiled `APPROVED_COMPANION_RELEASES` tuple is populated only from reviewed
   catalog/platform/provenance/derived-executable release evidence. It currently
@@ -92,17 +92,16 @@
   registration/installation mutation. Empty bootstrap pins perform no network
   request. Timeouts report unknown final state, not successful rollback.
   The one provisioned Mac bootstrap pins the immutable
-  `native-v2.12.0-macos-r1/v2.12.0` payload and its final archive and executable
+  `native-v2.12.0-macos-r2/v2.12.0` payload and its final archive and executable
   digests independently. Mac provisioning does not provision Linux/Windows,
   certify Chrome Web Store publication or activate a browser runtime. Actual
   public artifact readback precedes installation acceptance. Rebuilding the
   ordinary CLI wheel includes these source pins without additional dependencies;
   already installed CLI copies and previously built wheels remain unchanged.
-  This r1 bootstrap is not a working production installation: its native
-  CodeDirectory parser rejects candidate composition before mutation. The
-  corrected native source requires a new immutable signed/notarized artifact
-  and reviewed final pins before CLI release. Keep this integration draft until
-  installed-state readback succeeds; static pin assertions are not acceptance.
+  The corrected r2 artifact has passed actual native Chrome installation and
+  independent source-CLI installed-state verification on the signing host.
+  These checks do not establish Chrome pairing/control or CWS approval. The
+  earlier failing r1 distribution remains immutable and is not a fallback.
 - Stable repair/uninstall accept only the exact pathless native lifecycle v1
   receipt and its matching operation/exit/state/disposition. Local-only removal
   remains cleanup-pending exit 6, never full server revocation or key deletion;

@@ -14,12 +14,12 @@
 
 ## Security contracts
 
-- Draft release gate: the CodeDirectory parser correction is not yet packaged
-  into the independently pinned CLI bootstrap. The earlier r1 artifact fails
-  candidate composition before mutation. Preserve its immutable published
-  bytes; a new signed/notarized release, refreshed CLI pins and installed-state
-  readback must precede a working-installer claim. Isolated actual-public
-  candidate verification is not installation or live browser acceptance.
+- The corrected macOS companion is signed/notarized and published under the
+  protected r2 tag with independently pinned CLI bootstrap bytes. Actual native
+  Chrome installation and independent CLI installed-state readback passed on
+  the signing host. Preserve the earlier failing r1 distribution unchanged;
+  it is not a fallback. Live Chrome pairing/control, CWS approval and other
+  platform delivery/acceptance remain separate gates.
 - Native-host stdout is reserved exclusively for native-endian 32-bit length-prefixed frames. Diagnostics go to stderr or redacted CLI JSON.
 - Reject untrusted native caller origins before reading stdin. Origins must be exact, non-wildcard `chrome-extension://<32 lowercase a-p characters>/` values compiled from reviewed release policy.
 - Native inbound and outbound frames are capped at 768 KiB. Non-artifact JSON
@@ -254,8 +254,8 @@
   a future rebuilt binary, signed catalog/provenance verification or runtime
   activation. Genuine independent `publisher-2026` and `builder-2026` public
   roots are provisioned, with exact recipe/toolchain and version URLs under
-  the `native-v2.12.0-macos-r2` public download tag, which must be published under
-  the existing update/delete protection before installation. The failed r1
+  the published `native-v2.12.0-macos-r2` public download tag under existing
+  update/delete protection. The failed r1
   distribution remains immutable and is not an installation fallback.
   `RELEASE_SIGNATURE_VERIFIER_READY` denotes the invoked strict Ed25519
   verifier only. Missing/unverified downloads, platform proof, installed

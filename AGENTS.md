@@ -66,12 +66,12 @@
   software and is never installed into an Agent Zero Docker container. Keep the
   bootstrap fail-closed until reviewed release roots, published extension IDs,
   signed artifacts, and immutable install-state discovery land together.
-- The browser-companion integration remains a draft release: the corrected
-  macOS CodeDirectory parser is source-only while the CLI pins the earlier r1
-  artifact. Do not claim fresh-host installation acceptance or ship that
-  bootstrap as functional until a new immutable signed/notarized artifact,
-  refreshed CLI pins and installed-state readback complete. Linux delivery and
-  Windows verification/installation remain separate incomplete gates.
+- The corrected macOS companion is published under protected immutable tag
+  `native-v2.12.0-macos-r2`; the CLI pins its exact final archive/executable and
+  catalog bytes. Native Chrome installation plus independent CLI installed-state
+  verification passed on the signing host. This does not establish live Chrome
+  pairing/control, CWS approval, Linux delivery/acceptance or Windows native
+  verification/installation. The failed r1 artifact is never a fallback.
 - Local source development is a separate, compile-time-only exception, never a
   production bootstrap fallback. A binary built with Rust feature
   `local-development` may install only its own executing bytes for native host

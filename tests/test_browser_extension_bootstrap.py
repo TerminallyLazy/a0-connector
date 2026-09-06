@@ -18,12 +18,12 @@ def test_reviewed_macos_bootstrap_pins_bind_exact_signed_release(monkeypatch):
     pin = bootstrap._select()
     assert pin is not None
     assert pin.companion is release.MACOS_2_12_0_RELEASE
-    assert pin.archive_sha256 == "5c5e91d969982639bd80f273457584f8dc3b2ca88274990eb01bb0b0836ca8e2"
-    assert pin.archive_size == 4_545_324
+    assert pin.archive_sha256 == "f9ca468982794f3a767cdfe2d06f1fc308202d27c7c7d8f383e4a3e108d25482"
+    assert pin.archive_size == 4_546_235
     assert pin.archive_sha256 != pin.companion.executable_sha256
     assert pin.archive_url == (
         "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/"
-        "native-v2.12.0-macos-r1/v2.12.0/a0-browser-bridge-2.12.0-macos-universal2.tar.gz"
+        "native-v2.12.0-macos-r2/v2.12.0/a0-browser-bridge-2.12.0-macos-universal2.tar.gz"
     )
 
 

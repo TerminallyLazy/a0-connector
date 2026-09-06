@@ -16,9 +16,9 @@ def test_distributed_registry_contains_only_reviewed_mac_executable_and_catalog(
     pin = release.MACOS_2_12_0_RELEASE
     assert release._pin_valid(pin)
     assert (pin.version, pin.platform, pin.artifact_arch) == ("2.12.0", "macos", "universal2")
-    assert pin.executable_sha256 == "d4e467f800621cf47824437ee8379bcd2b611770db1b195e872a1500d5b2af25"
-    assert pin.executable_size == 10_356_928
-    assert pin.catalog_sha256 == "9c1cd6dd57daf31bc55b0d63342097cfb506e3ec7735a38a77c9acbce17a0088"
+    assert pin.executable_sha256 == "8f8125212bcafa3ead9e8f44c3dc8bc7213ee9f44570dd63638a242f3b067b6f"
+    assert pin.executable_size == 10_356_768
+    assert pin.catalog_sha256 == "9758f715d7648ee2246c82dc3e9a3574dfc55c07cad24d629166e0cd40ef35e4"
     assert pin.catalog_key_id == "publisher-2026"
     assert pin.extension_origins == ("chrome-extension://nhliclifilepdkoolioacpjpijomfplj/",)
 
