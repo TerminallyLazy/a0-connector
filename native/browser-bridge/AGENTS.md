@@ -14,7 +14,7 @@
 
 ## Security contracts
 
-- Companion 2.12.1 pins the new immutable `native-v2.12.1-macos` release
+- Companion 2.12.1 pins the new immutable `native-v2.12.1-macos-r2` release
   locations for the canonical operation-result decoder repair. The secure
   compatibility floor remains 2.12.0. New final-byte signing, notarization,
   publication and installation evidence are required; never overwrite r2 bytes.

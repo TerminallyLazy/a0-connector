@@ -18,15 +18,15 @@
   }],
   "pinned_release_catalogs": [{
     "release": "2.12.1",
-    "catalog_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos/catalog.json",
-    "signature_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos/catalog.sig"
+    "catalog_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos-r2/catalog.json",
+    "signature_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos-r2/catalog.sig"
   }],
   "pinned_build_provenance": [{
     "release": "2.12.1",
     "platform": "macos",
     "artifact_arch": "universal2",
-    "statement_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos/provenance-macos-universal2.json",
-    "signature_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos/provenance-macos-universal2.sig"
+    "statement_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos-r2/provenance-macos-universal2.json",
+    "signature_url": "https://raw.githubusercontent.com/TerminallyLazy/agent-zero-browser-releases/native-v2.12.1-macos-r2/provenance-macos-universal2.sig"
   }],
   "production_extension_origins": ["chrome-extension://nhliclifilepdkoolioacpjpijomfplj/"],
   "macos_release_identity": {
