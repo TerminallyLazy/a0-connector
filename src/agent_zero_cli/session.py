@@ -16,6 +16,7 @@ from agent_zero_cli.remote_files import RemoteFileUtility
 
 _REMOTE_TREE_KEEPALIVE_SECONDS = 60.0
 _RECOVERY_DELAYS_SECONDS = (1.0, 2.0, 5.0, 10.0, 20.0)
+_RECOVERY_STEADY_DELAY_SECONDS = 30.0
 
 
 class SessionObserver(Protocol):
@@ -1067,6 +1068,8 @@ class ConnectorSession:
     async def _recover_websocket(self) -> None:
         client = self.client
         context_id = self.context_id
+        host = self.host
+        base_url = client.base_url if client is not None else ""
         if client is None or not self.host or (
             not self.tools_only and not self.defer_context and not context_id
         ):
@@ -1077,15 +1080,23 @@ class ConnectorSession:
 
         try:
             self._stop_remote_tree_publisher()
-            for attempt, delay in enumerate(_RECOVERY_DELAYS_SECONDS, start=1):
+            attempt = 0
+            while True:
+                attempt += 1
+                delay = (
+                    _RECOVERY_DELAYS_SECONDS[attempt - 1]
+                    if attempt <= len(_RECOVERY_DELAYS_SECONDS)
+                    else _RECOVERY_STEADY_DELAY_SECONDS
+                )
                 self._stage(
                     "connecting",
                     "Connection lost; reconnecting...",
                     f"{self.host} (attempt {attempt})",
                 )
                 await asyncio.sleep(delay)
-                if self.client is not client or (
-                    not self.tools_only and not self.defer_context and not self.context_id
+                if (
+                    self.client is not client or self.host != host or client.base_url != base_url
+                    or self.context_id != context_id or self._emergency_disconnected
                 ):
                     return
                 try:
@@ -1107,7 +1118,7 @@ class ConnectorSession:
                     raise
                 except Exception as exc:
                     last_error = str(exc).strip() or exc.__class__.__name__
-                    if attempt == len(_RECOVERY_DELAYS_SECONDS):
+                    if attempt >= len(_RECOVERY_DELAYS_SECONDS) and not self.tools_only:
                         self._stage("error", "Connection lost", last_error)
                         self.agent_active = False
                         self.observer.on_disconnect()
@@ -1122,7 +1133,8 @@ class ConnectorSession:
                 self._notify_gateway_state_change()
                 return
         finally:
-            self._recovery_task = None
+            if self._recovery_task is asyncio.current_task():
+                self._recovery_task = None
 
     async def _remote_tree_publish_loop(self) -> None:
         try:
