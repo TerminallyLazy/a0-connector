@@ -80,6 +80,13 @@
   and a repair attempt must run before reporting that no supported browser is
   installed.
 - Explicit host-browser endpoints may be `host:port`, HTTP(S) CDP discovery addresses, or full DevTools WebSocket URLs. Resolve discovery addresses through `/json/version` on the host, preserve WebSocket path/query case, and fail explicitly instead of selecting another browser.
+- Chrome approval-mode servers omit HTTP discovery. For an explicit loopback
+  HTTP(S) endpoint returning 404, connect to the same origin's
+  `/devtools/browser` WebSocket and retain native approval. Never use that
+  fallback for authentication errors, other HTTP failures, or remote hosts.
+- A selected personal profile blocked from Playwright launch may resolve to its
+  discovered approval connection only when browser family and data directory
+  both match. Separate A0 profiles and other browser directories remain explicit.
 - WebSocket recovery in `connection.py` retries with the bounded `_RECOVERY_DELAYS_SECONDS` backoff and then keeps retrying on the steady `_RECOVERY_STEADY_DELAY_SECONDS` cadence indefinitely; after the initial ramp, Back and Try again remain available. A new connection, Back, or exit must cancel the prior recovery task before taking ownership. Recovery exits quietly when the active context changes and aborts when the client's `base_url` changes.
 - Host-browser discovery covers Safari on macOS through the system
   `safaridriver`, plus major Chromium-family browsers with CDP-compatible

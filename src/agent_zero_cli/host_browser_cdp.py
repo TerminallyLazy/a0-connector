@@ -40,9 +40,16 @@ class CDPConnection:
                 path = parsed.path if parsed.path == "/json/version" else "/json/version"
                 version_url = urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
                 async with self._session.get(version_url) as response:
-                    response.raise_for_status()
-                    version = await response.json()
-                endpoint = str(version.get("webSocketDebuggerUrl") or "").strip()
+                    if getattr(response, "status", None) == 404 and parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+                        # Chrome's user-approved server deliberately omits HTTP
+                        # discovery. This WebSocket path still requires its
+                        # native approval; never fall back on auth failures.
+                        endpoint = urlunsplit(("wss" if parsed.scheme == "https" else "ws",
+                            parsed.netloc, "/devtools/browser", parsed.query, ""))
+                    else:
+                        response.raise_for_status()
+                        version = await response.json()
+                        endpoint = str(version.get("webSocketDebuggerUrl") or "").strip()
                 resolved = urlsplit(endpoint)
                 if resolved.scheme not in {"ws", "wss"} or not resolved.netloc or not resolved.path:
                     raise CDPError(f"{version_url} did not return webSocketDebuggerUrl.")
