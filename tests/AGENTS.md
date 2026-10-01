@@ -17,6 +17,9 @@
 
 - Async tests use pytest/anyio with asyncio-compatible fixtures; many files set `pytestmark = pytest.mark.anyio`.
 - Prefer `tmp_path`, `monkeypatch`, and local fake classes over real user config or live services.
+- Normalize macOS `ru_maxrss` bytes to KiB before cross-platform memory-budget
+  assertions; Linux already reports KiB. Keep fixture executable names distinct
+  from profile directories on case-insensitive filesystems.
 - `tests/test_app.py` fake widgets mirror the widget API used by `AgentZeroCLI`. When app code calls a new widget method, update the fake.
 - Image-rendering tests use `ImageRenderer.for_test()` or a fake renderer; they
   must not probe a developer terminal, import native terminal backends for

@@ -8,7 +8,10 @@ import uuid
 
 
 async def verify_connection(session, capability, browser_selection=""):
-    return await asyncio.wait_for(_verify_connection(session, capability, browser_selection), timeout=40)
+    # Leave time for Chrome's bounded 60-second native approval handshake and
+    # the subsequent input/capture check. Preparation must not outlive its test.
+    timeout = 90 if capability == "browser" else 40
+    return await asyncio.wait_for(_verify_connection(session, capability, browser_selection), timeout=timeout)
 
 
 async def _verify_connection(session, capability, browser_selection=""):

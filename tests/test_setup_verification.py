@@ -8,6 +8,21 @@ from agent_zero_cli.setup_verification import verify_connection
 from agent_zero_cli.host_browser_manager import RELAUNCH_CONTEXT_ID
 
 
+def test_browser_check_outlives_native_approval_handshake(monkeypatch):
+    from agent_zero_cli.host_browser_common import REMOTE_DEBUGGING_CONNECT_TIMEOUT_SECONDS
+    from agent_zero_cli import setup_verification
+    timeouts = []
+    async def bounded(coroutine, *, timeout):
+        coroutine.close()
+        timeouts.append(timeout)
+        return {}
+    monkeypatch.setattr(setup_verification.asyncio, 'wait_for', bounded)
+    asyncio.run(verify_connection(None, 'browser'))
+    asyncio.run(verify_connection(None, 'computer_use'))
+    assert REMOTE_DEBUGGING_CONNECT_TIMEOUT_SECONDS < timeouts[0] < 100
+    assert timeouts[1] == 40
+
+
 class Browser:
     def __init__(self, fail=False):
         self._sessions = {}
