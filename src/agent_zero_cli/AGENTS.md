@@ -87,6 +87,9 @@
 - A selected personal profile blocked from Playwright launch may resolve to its
   discovered approval connection only when browser family and data directory
   both match. Separate A0 profiles and other browser directories remain explicit.
+- Browser setup verification has a 90-second bound so the 60-second native
+  approval handshake can finish before typing/capture. Computer verification
+  retains its 40-second bound; Launcher must allow the correlated result to finish.
 - WebSocket recovery in `connection.py` retries with the bounded `_RECOVERY_DELAYS_SECONDS` backoff and then keeps retrying on the steady `_RECOVERY_STEADY_DELAY_SECONDS` cadence indefinitely; after the initial ramp, Back and Try again remain available. A new connection, Back, or exit must cancel the prior recovery task before taking ownership. Recovery exits quietly when the active context changes and aborts when the client's `base_url` changes.
 - Host-browser discovery covers Safari on macOS through the system
   `safaridriver`, plus major Chromium-family browsers with CDP-compatible
