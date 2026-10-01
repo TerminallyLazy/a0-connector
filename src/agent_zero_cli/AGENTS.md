@@ -90,6 +90,19 @@
 - Browser setup verification has a 90-second bound so the 60-second native
   approval handshake can finish before typing/capture. Computer verification
   retains its 40-second bound; Launcher must allow the correlated result to finish.
+- Direct CDP connections use idle WebSocket heartbeats without a receive/idle
+  expiry. A closed socket or failed reader invalidates the runtime; the next
+  operation reconnects to the selected endpoint under the session start lock.
+  Retain browser IDs only for the same surviving CDP target, including blank
+  tabs; never reuse a vanished tab's ID, close personal tabs during reconnect,
+  or replay an interrupted input. Native browser approval still applies.
+  Bound CDP messages to 36 MiB so base64 for permitted 25 MiB captures fits;
+  retain the decoded screenshot limit and reject larger protocol messages.
+- Tools-only Launcher sessions keep retrying server transport recovery every
+  30 seconds after the initial backoff. Preserve browser sessions and takeover
+  holds through an outage; stop recovery on shutdown, emergency disconnect,
+  client/host replacement or context change. Interactive/headless sessions
+  retain their existing finite recovery policy.
 - WebSocket recovery in `connection.py` retries with the bounded `_RECOVERY_DELAYS_SECONDS` backoff and then keeps retrying on the steady `_RECOVERY_STEADY_DELAY_SECONDS` cadence indefinitely; after the initial ramp, Back and Try again remain available. A new connection, Back, or exit must cancel the prior recovery task before taking ownership. Recovery exits quietly when the active context changes and aborts when the client's `base_url` changes.
 - Host-browser discovery covers Safari on macOS through the system
   `safaridriver`, plus major Chromium-family browsers with CDP-compatible

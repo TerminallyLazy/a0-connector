@@ -1577,6 +1577,10 @@ async def test_remote_debugging_session_attaches_without_closing_user_context(
     instances = []
 
     class FakeCDPConnection:
+        @property
+        def is_connected(self):
+            return not self.closed
+
         def __init__(self, endpoint: str) -> None:
             self.endpoint = endpoint
             self.closed = False
@@ -1696,6 +1700,10 @@ async def test_remote_debugging_connection_retries_changed_active_port(
     instances = []
 
     class RefreshingCDPConnection:
+        @property
+        def is_connected(self):
+            return not self.closed
+
         def __init__(self, endpoint: str) -> None:
             self.endpoint = endpoint
             self.closed = False
@@ -1753,6 +1761,10 @@ async def test_remote_debugging_session_opens_lists_and_reads_content(
     instances = []
 
     class FakeCDPConnection:
+        @property
+        def is_connected(self):
+            return not self.closed
+
         def __init__(self, endpoint: str) -> None:
             self.endpoint = endpoint
             self.closed = False

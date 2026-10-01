@@ -35,6 +35,10 @@
 ## Work Guidance
 
 - Add focused regression tests near the behavior changed.
+- `test_host_browser_connection.py` uses local WebSocket peers to verify idle
+  heartbeats, silent-peer detection, pending-command failure without replay,
+  exact-target recovery, and cancelled approval cleanup. Gateway session tests
+  cover extended recovery and explicit shutdown without releasing takeover holds.
 - Preview tests must assert forced half-cell mode and usable explicit widget
   construction, while native TGP/Sixel visual acceptance remains a separately
   recorded capable-terminal check.
