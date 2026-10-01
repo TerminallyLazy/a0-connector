@@ -142,6 +142,14 @@ class ConnectorSession:
             enabled=self.remote_exec_enabled,
             allow_writes=self.remote_file_write_enabled,
         )
+        from .host_control import HostControl
+        from .host_viewer import HostViewer
+        from .config import _ENV_DIR
+        import hashlib
+        identity = hashlib.sha256(str(self.gateway.get("id", "session")).encode()).hexdigest()[:32]
+        self.host_control = HostControl(_ENV_DIR / "host-control" / (identity + ".json"))
+        self.host_viewer = HostViewer(self, self.host_control)
+        self.setup_verifications = {}
         self.client: A0Client | None = None
         self.capabilities: dict[str, Any] = {}
         self.connector_features: set[str] = set()
@@ -183,6 +191,7 @@ class ConnectorSession:
         capabilities = await self._fetch_and_validate_capabilities(client)
         self.capabilities = capabilities
         self.connector_features = set(capabilities.get("features") or [])
+        self.host_control.enabled = self.gateway_enabled and "host_viewer_v1" in self.connector_features
         if self.tools_only and not {
             "launcher_gateway",
             "launcher_gateway_file_write",
@@ -661,7 +670,9 @@ class ConnectorSession:
         self._notify_gateway_state_change()
 
     def _handle_disconnect(self) -> None:
+        self.setup_verifications.clear()
         self.connected = False
+        self.host_control.hold()
         self._notify_gateway_state_change()
         if self._emergency_disconnected:
             return
@@ -727,6 +738,14 @@ class ConnectorSession:
         return bool(scopes.get(scope))
 
     async def _handle_file_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_file_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_file_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("files"):
             return {
                 "op_id": data.get("op_id", ""),
@@ -740,6 +759,14 @@ class ConnectorSession:
         return await self.remote_files.handle_file_op_async(data, self.client, check_access)
 
     async def _handle_exec_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_exec_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_exec_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("code_execution"):
             return {
                 "op_id": data.get("op_id", ""),
@@ -750,6 +777,14 @@ class ConnectorSession:
         return await self.remote_exec.handle_exec_op(data)
 
     async def _handle_computer_use_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_computer_use_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_computer_use_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("computer_use"):
             return _unsupported_result(
                 data,
@@ -761,6 +796,20 @@ class ConnectorSession:
         return await self.computer_use.handle_op(data)
 
     async def _handle_browser_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        if data.get("action") == "_host_viewer":
+            try:
+                result = await self.host_viewer.handle(data)
+                return {"op_id": data.get("op_id"), "ok": True, "result": result}
+            except Exception as exc:
+                return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_CONTROL", "error": str(exc)}
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_browser_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_browser_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("browser"):
             return _unsupported_result(data, tool="Host browser", code="HOST_BROWSER_DISABLED")
         if self.host_browser is None:
@@ -777,6 +826,8 @@ class ConnectorSession:
         _request: dict[str, Any],
         _result: dict[str, Any],
     ) -> None:
+        if _request.get("action") == "_host_viewer":
+            return
         await self.refresh_remote_tool_metadata()
         self._notify_gateway_state_change()
 
@@ -859,12 +910,14 @@ class ConnectorSession:
         return self._gateway_scopes()
 
     async def set_gateway_master(self, enabled: bool) -> None:
+        self.setup_verifications.clear()
         self.master_enabled = bool(enabled)
         self.gateway["master_enabled"] = self.master_enabled
         await self._close_disabled_gateway_sessions()
         self._notify_gateway_state_change()
 
     async def _close_disabled_gateway_sessions(self) -> None:
+        self.setup_verifications.clear()
         scopes = self._gateway_scopes()
         if not self.master_enabled or not scopes["code_execution"]:
             await self.remote_exec.close()
@@ -894,11 +947,14 @@ class ConnectorSession:
             ],
             "status": {},
         }
+        if self.host_control.enabled:
+            metadata["features"].append("host_viewer_v1")
         browser = self._host_browser_metadata()
         computer = self._computer_use_metadata()
         status_details: dict[str, Any] = {
             "browser": browser,
             "computer_use": computer,
+            "setup_verifications": dict(self.setup_verifications),
         }
         state = "connected" if self.connected else "connecting"
         browser_status = str(browser.get("status", "") or "").lower()
@@ -931,6 +987,8 @@ class ConnectorSession:
         if self._emergency_disconnected:
             state = "disconnected"
         metadata["state"] = state
+        if self.host_control.enabled:
+            status_details["host_control"] = self.host_control.snapshot()
         metadata["status"] = status_details
         return metadata
 

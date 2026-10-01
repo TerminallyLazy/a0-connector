@@ -225,6 +225,14 @@
 
 ## Verification
 
+- `setup_verification.py` implements explicit `host_setup_verify_v1` gateway
+  checks. It uses the host-control gate, refuses held or active host work, and
+  never resumes A0. Browser tests type only in a newly created blank page, close
+  that page and return the prepared profile to the relaunch handoff slot.
+  Computer tests capture without sending input, then stop their private helper.
+  Correlated results contain evidence names and time, never pixels. Scope or
+  master changes and preparation invalidate in-memory verification metadata.
+
 - Broad CLI checks: `./.venv/bin/python -m pytest tests/test_app.py tests/test_client.py -v`.
 - Remote tools: `./.venv/bin/python -m pytest tests/test_remote_files.py tests/test_remote_exec.py -v`.
 - Browser bridge: `./.venv/bin/python -m pytest tests/test_host_browser.py -v`.

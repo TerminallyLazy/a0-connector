@@ -11,6 +11,10 @@
 
 ## Local Contracts
 
+- `test_setup_verification.py`, `test_host_control.py` and `test_host_viewer.py`
+  cover explicit verification, held-state exclusion, owned-page cleanup and
+  takeover races without touching real host apps or persisting test pixels.
+
 - Async tests use pytest/anyio with asyncio-compatible fixtures; many files set `pytestmark = pytest.mark.anyio`.
 - Prefer `tmp_path`, `monkeypatch`, and local fake classes over real user config or live services.
 - `tests/test_app.py` fake widgets mirror the widget API used by `AgentZeroCLI`. When app code calls a new widget method, update the fake.
