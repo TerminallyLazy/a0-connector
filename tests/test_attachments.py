@@ -84,7 +84,7 @@ def test_pillow_clipboard_image_reads_copied_image_file(tmp_path: Path, monkeypa
     assert attachments_mod._read_pillow_clipboard_image() == ("image/webp", b"webp-bytes")
 
 
-def test_create_image_file_upload_reads_supported_image(tmp_path: Path) -> None:
+def test_create_image_file_upload_keeps_supported_image_disk_backed(tmp_path: Path) -> None:
     source = tmp_path / "diagram final.PNG"
     source.write_bytes(b"png-bytes")
 
@@ -93,7 +93,7 @@ def test_create_image_file_upload_reads_supported_image(tmp_path: Path) -> None:
     assert upload.filename.startswith("diagram-final-")
     assert upload.filename.endswith(".png")
     assert upload.mime_type == "image/png"
-    assert upload.content == b"png-bytes"
+    assert upload.content == source
 
 
 def test_create_image_file_upload_rejects_non_image(tmp_path: Path) -> None:
@@ -104,6 +104,30 @@ def test_create_image_file_upload_rejects_non_image(tmp_path: Path) -> None:
         attachments_mod.create_image_file_upload(source)
     except attachments_mod.AttachmentError as exc:
         assert "Unsupported image type" in str(exc)
+    else:
+        raise AssertionError("Expected AttachmentError")
+
+
+def test_create_file_upload_preserves_bytes_and_detects_mime_type(tmp_path: Path) -> None:
+    source = tmp_path / "project notes.txt"
+    source.write_bytes(b"plain-text")
+
+    upload = attachments_mod.create_file_upload(source, max_bytes=32)
+
+    assert upload.filename.startswith("project-notes-")
+    assert upload.filename.endswith(".txt")
+    assert upload.mime_type == "text/plain"
+    assert upload.content == b"plain-text"
+
+
+def test_create_file_upload_enforces_read_limit(tmp_path: Path) -> None:
+    source = tmp_path / "large.bin"
+    source.write_bytes(b"12345")
+
+    try:
+        attachments_mod.create_file_upload(source, max_bytes=4)
+    except attachments_mod.AttachmentError as exc:
+        assert "larger than 4 bytes" in str(exc)
     else:
         raise AssertionError("Expected AttachmentError")
 

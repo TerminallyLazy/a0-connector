@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
+import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
-import tomllib
 
 import pytest
 
@@ -13,10 +15,33 @@ from agent_zero_cli import __version__
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_package_version_matches_cli_version() -> None:
-    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+def test_windows_machine_stdio_preserves_exact_unicode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = "WINDOWS_✓_café_世界"
+    stdin_bytes = io.BytesIO((json.dumps({"value": value}, ensure_ascii=False) + "\n").encode())
+    stdout_bytes = io.BytesIO()
+    stdin = io.TextIOWrapper(stdin_bytes, encoding="cp1252")
+    stdout = io.TextIOWrapper(stdout_bytes, encoding="cp1252")
+    stderr = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(__main__.sys, "stdin", stdin)
+    monkeypatch.setattr(__main__.sys, "stdout", stdout)
+    monkeypatch.setattr(__main__.sys, "stderr", stderr)
 
-    assert pyproject["project"]["version"] == __version__
+    __main__._configure_windows_machine_stdio()
+
+    payload = json.loads(stdin.readline())
+    stdout.write(json.dumps(payload, ensure_ascii=False))
+    stdout.flush()
+    assert payload == {"value": value}
+    assert json.loads(stdout_bytes.getvalue().decode()) == {"value": value}
+
+
+def test_package_version_matches_cli_version() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    version_line = next(line for line in pyproject.splitlines() if line.startswith("version = "))
+
+    assert version_line.removeprefix("version = ").strip().strip('"') == __version__
 
 
 def test_main_prints_version_without_launching_app(
@@ -139,6 +164,13 @@ def test_main_headless_routes_to_headless_launcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     launched: list[dict[str, object]] = []
+    configured: list[bool] = []
+    monkeypatch.setattr(__main__.sys, "platform", "win32")
+    monkeypatch.setattr(
+        __main__,
+        "_configure_windows_machine_stdio",
+        lambda: configured.append(True),
+    )
     monkeypatch.setattr(__main__, "_run_headless", lambda **kwargs: launched.append(dict(kwargs)) or 0)
 
     exit_code = __main__.main(
@@ -159,6 +191,7 @@ def test_main_headless_routes_to_headless_launcher(
     )
 
     assert exit_code == 0
+    assert configured == [True]
     assert launched == [
         {
             "host": "http://agent.test:32080",
@@ -169,6 +202,58 @@ def test_main_headless_routes_to_headless_launcher(
             "print_prompt": "what is 2+2",
             "workspace": "/tmp/work",
             "discover_instances": False,
+            "launcher_tag": False,
+            "agent_profile": "",
+            "attachment_refs": [],
+        }
+    ]
+
+
+def test_main_launcher_tag_routes_safe_headless_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launched: list[dict[str, object]] = []
+    monkeypatch.setattr(__main__, "_run_headless", lambda **kwargs: launched.append(dict(kwargs)) or 0)
+
+    exit_code = __main__.main(
+        [
+            "headless",
+            "--host",
+            "http://agent.test:32080",
+            "--new-chat",
+            "--output",
+            "jsonl",
+            "--print",
+            "--workspace",
+            "/tmp/work",
+            "--no-docker-discovery",
+            "--launcher-tag",
+            "--agent-profile",
+            "developer",
+            "--attachment-ref",
+            "/a0/usr/uploads/a0-tag-window.png",
+            "--attachment-ref",
+            "/a0/usr/uploads/brief.pdf",
+        ]
+    )
+
+    assert exit_code == 0
+    assert launched == [
+        {
+            "host": "http://agent.test:32080",
+            "chat": "",
+            "chat_last": False,
+            "new_chat": True,
+            "output": "jsonl",
+            "print_prompt": "",
+            "workspace": "/tmp/work",
+            "discover_instances": False,
+            "launcher_tag": True,
+            "agent_profile": "developer",
+            "attachment_refs": [
+                "/a0/usr/uploads/a0-tag-window.png",
+                "/a0/usr/uploads/brief.pdf",
+            ],
         }
     ]
 
@@ -212,17 +297,55 @@ def test_main_gateway_routes_without_loading_textual(
     ]
 
 
+def test_headless_and_gateway_launchers_do_not_import_terminal_image_renderer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_zero_cli import config as config_mod
+    from agent_zero_cli import gateway as gateway_mod
+    from agent_zero_cli.headless import runner as headless_runner
+
+    for module_name in (
+        "textual_image",
+        "agent_zero_cli.app",
+        "agent_zero_cli.image_store",
+        "agent_zero_cli.widgets.image_entry",
+    ):
+        monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.setattr(config_mod, "load_config", lambda: SimpleNamespace(instance_url=""))
+    monkeypatch.setattr(headless_runner, "run_headless", lambda _options: 0)
+    monkeypatch.setattr(gateway_mod, "run_gateway", lambda _options, _config: 0)
+
+    assert __main__._run_headless() == 0
+    assert __main__._run_gateway(
+        host="http://agent.test",
+        workspace=".",
+        gateway_id="test",
+        host_label="",
+        master_enabled=True,
+        scopes="file_read",
+        browser_selection="",
+    ) == 0
+    assert "textual_image" not in sys.modules
+    assert "agent_zero_cli.app" not in sys.modules
+    assert "agent_zero_cli.image_store" not in sys.modules
+    assert "agent_zero_cli.widgets.image_entry" not in sys.modules
+
+
 def test_run_app_installs_textual_input_decoder_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agent_zero_cli import app as app_mod
     from agent_zero_cli import config as config_mod
+    from agent_zero_cli import image_render
     from agent_zero_cli import textual_compat
 
     calls: list[str] = []
 
     class FakeAgentZeroCLI:
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            passed_renderer = kwargs["image_renderer"]
+            assert passed_renderer.mode == "halfcell"
+            assert passed_renderer._widget_factory is None
             calls.append("app-init")
 
         def run(self) -> None:
@@ -233,6 +356,14 @@ def test_run_app_installs_textual_input_decoder_guard(
         "install_textual_linux_input_decoder_guard",
         lambda: calls.append("guard"),
     )
+    real_initialize = image_render.initialize_image_renderer
+
+    def initialize_for_test() -> image_render.ImageRenderer:
+        calls.append("renderer-init")
+        return real_initialize()
+
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_entrypoint.py::automated")
+    monkeypatch.setattr(image_render, "initialize_image_renderer", initialize_for_test)
     monkeypatch.setattr(
         config_mod,
         "load_config",
@@ -242,4 +373,4 @@ def test_run_app_installs_textual_input_decoder_guard(
 
     __main__._run_app()
 
-    assert calls == ["guard", "app-init", "app-run"]
+    assert calls == ["guard", "renderer-init", "app-init", "app-run"]

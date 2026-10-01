@@ -36,6 +36,7 @@ _DEBUG_LOG_ENV = "A0_COMPUTER_USE_DEBUG_LOG"
 _DEFAULT_CONTAINER_ARTIFACT_ROOT = "/a0/tmp/_a0_connector/computer_use"
 _HELPER_PROTOCOL_NOISE_MAX_LINES = 8
 _HELPER_STDIO_LIMIT = 32 * 1024 * 1024
+_CAPTURE_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
 _HELPER_DEFAULT_RESPONSE_TIMEOUT_SECONDS = 30.0
 _HELPER_RESPONSE_GRACE_SECONDS = 8.0
 _HELPER_CLOSE_DRAIN_TIMEOUT_SECONDS = 1.0
@@ -71,6 +72,7 @@ _MUTATING_ACTIONS = {
     "element_action",
     "ax_action",
     "uia_action",
+    "tag_replace",
 }
 _SUPPORTED_DISPATCH_MODES = {"background", "foreground", "auto"}
 _DEFAULT_FRESH_CAPTURE_TIMEOUT_SECONDS = 0.45
@@ -169,9 +171,22 @@ def _capture_artifact_from_path(path: str) -> dict[str, str] | None:
     if not capture_path.is_file():
         return None
     try:
+        source_size = capture_path.stat().st_size
+        if source_size > _CAPTURE_ARTIFACT_MAX_BYTES:
+            raise ValueError(
+                "Computer Use capture is too large to return inline "
+                f"({source_size} bytes, limit {_CAPTURE_ARTIFACT_MAX_BYTES} bytes). "
+                "Use the saved host file through the HTTP bulk-transfer path."
+            )
         payload = capture_path.read_bytes()
     except OSError:
         return None
+    if len(payload) > _CAPTURE_ARTIFACT_MAX_BYTES:
+        raise ValueError(
+            "Computer Use capture grew beyond the inline limit while being read "
+            f"({len(payload)} bytes, limit {_CAPTURE_ARTIFACT_MAX_BYTES} bytes). "
+            "Use the saved host file through the HTTP bulk-transfer path."
+        )
     return {
         "filename": capture_path.name,
         "mime": "image/png",
@@ -470,6 +485,10 @@ class ComputerUseManager:
     def status_detail(self) -> str:
         return self.last_error
 
+    @property
+    def launcher_tag_supported(self) -> bool:
+        return "a0-tag" in set(self._backend_metadata.get("features") or [])
+
     def hello_metadata(self) -> dict[str, Any]:
         metadata = {
             "supported": self.supported,
@@ -631,6 +650,65 @@ class ComputerUseManager:
 
     async def disconnect(self) -> None:
         await self.close()
+
+    async def tag_context(self) -> dict[str, Any]:
+        response = await self._tag_action("tag_context")
+        if not bool(response.get("ok")):
+            session = self._sessions.get("launcher-tag")
+            if session is not None:
+                with contextlib.suppress(Exception):
+                    await self._stop_session(f"tag-{uuid.uuid4().hex}", session)
+        return response
+
+    async def tag_replace(self, target_token: str, replacement: str) -> dict[str, Any]:
+        return await self._tag_action(
+            "tag_replace",
+            target_token=str(target_token or "").strip(),
+            replacement=str(replacement or ""),
+        )
+
+    async def tag_release(self, target_token: str) -> dict[str, Any]:
+        context_id = "launcher-tag"
+        session = self._sessions.get(context_id)
+        if session is None or not session.active or not session.session_id:
+            return self._success(f"tag-{uuid.uuid4().hex}", {"released": False})
+        try:
+            return await self._dispatch_session_action(
+                f"tag-{uuid.uuid4().hex}",
+                session,
+                {
+                    "action": "tag_release",
+                    "context_id": context_id,
+                    "target_token": str(target_token or "").strip(),
+                },
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                await self._stop_session(f"tag-{uuid.uuid4().hex}", session)
+
+    async def _tag_action(self, action: str, **payload: Any) -> dict[str, Any]:
+        op_id = f"tag-{uuid.uuid4().hex}"
+        if not self.launcher_tag_supported:
+            return self._error(
+                op_id,
+                _UNSUPPORTED_ERROR,
+                message="A0 Tag is not supported by this Computer Use backend.",
+            )
+        if not self.supported:
+            return self._error(op_id, _UNSUPPORTED_ERROR)
+        if not self.enabled:
+            return self._error(op_id, _DISABLED_ERROR)
+        context_id = "launcher-tag"
+        session = self._sessions.setdefault(context_id, _HelperSession(context_id=context_id))
+        if not session.active or not session.session_id:
+            started = await self._start_session(op_id, session)
+            if not bool(started.get("ok")):
+                return started
+        return await self._dispatch_session_action(
+            op_id,
+            session,
+            {"action": action, "context_id": context_id, **payload},
+        )
 
     async def rearm(self, context_id: str | None = None) -> dict[str, Any]:
         """Prompt the user once and keep the resulting approved session attached."""
@@ -1059,6 +1137,8 @@ class ComputerUseManager:
             request = self._normalize_action_payload(action, payload, context_id=context_id)
             return await self._dispatch_session_action(op_id, session, request)
         except ValueError as exc:
+            if action == "capture":
+                self._prune_capture_artifacts()
             self._set_status("error", error=str(exc))
             return self._error(op_id, "BAD_REQUEST", message=str(exc))
 
@@ -1563,7 +1643,7 @@ class ComputerUseManager:
                     result_dict.pop("host_path", None)
                     result_dict.pop("container_path", None)
                     self._prune_capture_artifacts()
-            if _coerce_bool(helper_request.get("fresh")):
+            if action_name == "capture" and _coerce_bool(helper_request.get("fresh")):
                 result_dict.setdefault("fresh", True)
                 fresh_after = helper_request.get("fresh_after")
                 if fresh_after is not None:
@@ -1614,7 +1694,11 @@ class ComputerUseManager:
             return self._success(op_id, result)
 
         allow_prompt = self.trust_mode != "allow"
-        if self._uses_macos_permission_setup() and allow_prompt:
+        if (
+            self._uses_macos_permission_setup()
+            and session.context_id != "launcher-tag"
+            and allow_prompt
+        ):
             prepared = await self._prepare_macos_permissions(
                 session,
                 prompt=True,

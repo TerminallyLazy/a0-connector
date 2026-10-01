@@ -5,25 +5,52 @@ import inspect
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image as PILImage
 from rich.panel import Panel
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.css.query import NoMatches
+from textual.fuzzy import Matcher
 from textual.selection import SELECT_ALL
 
-from agent_zero_cli import __version__, chat_commands, connection, event_handlers, model_commands, self_update, splash_helpers
+from agent_zero_cli import (
+    __version__,
+    chat_commands,
+    connection,
+    event_handlers,
+    model_commands,
+    profile_commands,
+    self_update,
+    splash_helpers,
+)
 from agent_zero_cli.app import AgentZeroCLI
 from agent_zero_cli.attachments import AttachmentRef, AttachmentUpload
 from agent_zero_cli.client import DEFAULT_HOST
 from agent_zero_cli.config import CLIConfig
 from agent_zero_cli.instance_discovery import DiscoveredInstance, DiscoveryResult
-from agent_zero_cli.rendering import extract_detail, render_connector_event
+from agent_zero_cli.media_refs import ImageReference
+from agent_zero_cli.image_store import ImageAsset
+from agent_zero_cli.rendering import (
+    completion_notification_sequence,
+    extract_detail,
+    format_duration,
+    render_connector_event,
+)
 from agent_zero_cli.remote_files import RemoteTreeSnapshot
 from agent_zero_cli.screens.installed_plugins import InstalledPluginsScreen
 from agent_zero_cli.screens.model_runtime import ModelRuntimeResult
 from agent_zero_cli.widgets import computer_use_banner as computer_use_banner_mod
-from agent_zero_cli.widgets.command_palette import is_raw_skill_command, is_raw_slash_command
-from agent_zero_cli.widgets.chat_log import ChatLog, SelectableStatic
+from agent_zero_cli.widgets.command_palette import (
+    _container_reference_directory,
+    _scoped_reference_catalog,
+    OrderedSystemCommandsProvider,
+    is_raw_skill_command,
+    is_raw_slash_command,
+    reference_query_at_cursor,
+)
+from agent_zero_cli.widgets.chat_log import ChatLog, SelectableStatic, TranscriptEntry
+from agent_zero_cli.widgets.image_entry import ImageEntry
 from agent_zero_cli.widgets import (
     ChatInput,
     ComputerUseBanner,
@@ -34,6 +61,7 @@ from agent_zero_cli.widgets import (
     MessageQueueBar,
     ModelSwitcherBar,
     ProfileMenuItem,
+    ProfileMenuPopover,
     ProjectMenuItem,
     ProjectMenuPopover,
     SplashState,
@@ -59,7 +87,9 @@ class FakeChatLog:
         self.intro_visible = False
         self.cleared = False
         self.writes: list[object] = []
+        self.before_writes: list[tuple[int, object]] = []
         self.status_entries: dict[int, dict[str, object]] = {}
+        self.image_entries: dict[int, tuple[ImageReference, ...]] = {}
         self._seq_to_widget: dict[int, object] = {}
         self._active_seq: int | None = None
         self._active_meta: dict[str, object] = {}
@@ -69,6 +99,9 @@ class FakeChatLog:
 
     def write(self, message: object) -> None:
         self.writes.append(message)
+
+    def write_before(self, sequence: int, message: object) -> None:
+        self.before_writes.append((sequence, message))
 
     def ensure_intro_banner(self) -> None:
         self.intro_visible = True
@@ -82,8 +115,9 @@ class FakeChatLog:
         *,
         active: bool = False,
         scroll: bool = True,
+        prepend: bool = False,
     ) -> None:
-        del label, scroll
+        del label, scroll, prepend
         self.status_entries[sequence] = {
             "detail": detail,
             "meta": meta or {},
@@ -101,13 +135,26 @@ class FakeChatLog:
         self._active_seq = sequence
         self._active_meta = meta or {}
 
+    def append_or_update_images(
+        self,
+        sequence: int,
+        references: tuple[ImageReference, ...],
+        *,
+        prepend: bool = False,
+    ) -> None:
+        del prepend
+        self.image_entries[sequence] = references
+
     def dim_active_status(self) -> None:
         self._active_seq = None
         self._active_meta = {}
 
-    def clear(self) -> None:
+    def clear(self, *, preserve_intro: bool = False) -> None:
         self.cleared = True
+        if not preserve_intro:
+            self.intro_visible = False
         self.status_entries.clear()
+        self.image_entries.clear()
         self._active_seq = None
         self._active_meta = {}
 
@@ -117,6 +164,18 @@ class FakeChatLog:
     def copyable_text(self, *, visible_only: bool = True) -> str:
         self.copy_visible_only = visible_only
         return self.copy_text
+
+
+class FakeImageStore:
+    def __init__(self) -> None:
+        self.cancel_calls = 0
+        self.clear_calls = 0
+
+    def cancel_pending(self) -> None:
+        self.cancel_calls += 1
+
+    def clear(self) -> None:
+        self.clear_calls += 1
 
 
 class FakeInput:
@@ -668,17 +727,38 @@ async def test_full_cli_quit_resets_computer_use_enablement(dummy_app: DummyAgen
     class FakeClient:
         def __init__(self) -> None:
             self.disconnect_calls = 0
+            self.disconnect_callbacks = 0
+            self.on_disconnect = self._on_disconnect
+
+        def _on_disconnect(self) -> None:
+            self.disconnect_callbacks += 1
 
         async def disconnect(self) -> None:
             self.disconnect_calls += 1
+            if self.on_disconnect is not None:
+                self.on_disconnect()
 
     fake_tty = FakePythonTty()
     fake_client = FakeClient()
+    store = FakeImageStore()
     exit_calls: list[bool] = []
+    epoch_before_exit = dummy_app._image_load_epoch
     dummy_app._python_tty = fake_tty  # type: ignore[assignment]
     dummy_app.client = fake_client  # type: ignore[assignment]
+    dummy_app.image_store = store  # type: ignore[assignment]
     dummy_app.exit = lambda: exit_calls.append(True)  # type: ignore[method-assign]
     dummy_app._computer_use.set_enabled(True)
+    recovery_cancelled: list[bool] = []
+
+    async def stale_recovery() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            recovery_cancelled.append(True)
+
+    recovery_task = asyncio.create_task(stale_recovery())
+    dummy_app._websocket_recovery_task = recovery_task
+    await asyncio.sleep(0)
 
     await dummy_app._disconnect_and_exit()
 
@@ -687,6 +767,12 @@ async def test_full_cli_quit_resets_computer_use_enablement(dummy_app: DummyAgen
     assert dummy_app._computer_use.disconnect_calls == 1
     assert fake_tty.close_calls == 1
     assert fake_client.disconnect_calls == 1
+    assert fake_client.disconnect_callbacks == 0
+    assert recovery_task.cancelled()
+    assert recovery_cancelled == [True]
+    assert dummy_app._websocket_recovery_task is None
+    assert store.clear_calls == 1
+    assert dummy_app._image_load_epoch == epoch_before_exit + 1
     assert exit_calls == [True]
 
 
@@ -702,6 +788,82 @@ def test_profile_menu_item_click_stops_event_and_posts_selection() -> None:
     assert stopped == [True]
     assert len(captured) == 1
     assert isinstance(captured[0], ProfileMenuItem.Selected)
+    assert captured[0].action == "select"
+
+
+def test_profile_choices_hide_default_but_keep_current_status() -> None:
+    current, profiles = profile_commands.profile_menu_state_from_settings(
+        {
+            "settings": {"agent_profile": "default"},
+            "additional": {
+                "agent_subdirs": [
+                    {"value": "default", "label": "Default"},
+                    {"value": "agent0", "label": "Agent 0"},
+                ],
+            },
+        }
+    )
+
+    assert current == "default"
+    assert profiles == [{"key": "agent0", "label": "Agent 0"}]
+    assert profile_commands.resolve_profile_selection(profiles, "default")[0] is None
+
+
+async def test_profile_menu_does_not_offer_edit_for_active_default() -> None:
+    class ProfileMenuApp(App[None]):
+        def compose(self) -> ComposeResult:
+            yield ProfileMenuPopover(
+                [{"key": "agent0", "label": "Agent 0"}],
+                current_profile="default",
+            )
+
+    app = ProfileMenuApp()
+    async with app.run_test():
+        items = list(app.query(ProfileMenuItem))
+
+    assert [(item.action, item.profile_key) for item in items] == [
+        ("create", ""),
+        ("select", "agent0"),
+    ]
+
+
+async def test_profile_menu_keeps_create_available_when_default_is_the_only_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = AgentZeroCLI(
+        config=CLIConfig(instance_url="http://example.test"),
+        auto_connect_single_instance=False,
+        discover_instances=False,
+        connect_configured_host=False,
+    )
+
+    async def async_noop(*args, **kwargs) -> None:
+        del args, kwargs
+
+    async def fake_menu_state(*args, **kwargs):
+        del args, kwargs
+        return "default", []
+
+    monkeypatch.setattr(app, "_startup", async_noop)
+    monkeypatch.setattr(app, "_start_cli_update_check", lambda: None)
+    monkeypatch.setattr(profile_commands, "load_profile_menu_state", fake_menu_state)
+    notices: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        app,
+        "_show_notice",
+        lambda message, *, error=False: notices.append((message, error)),
+    )
+
+    async with app.run_test():
+        app.connector_features = {"agent_editor"}
+        await app._open_profile_menu()
+        item = app.query_one(ProfileMenuItem)
+        await app._hide_profile_menu()
+        app.connector_features = set()
+        await app._open_profile_menu()
+
+    assert (item.action, item.profile_key) == ("create", "")
+    assert notices == [("No agent profiles are available from Agent Zero Core.", True)]
 
 
 def test_project_menu_item_click_stops_event_and_posts_selection() -> None:
@@ -1192,6 +1354,38 @@ def test_start_instance_discovery_can_be_disabled_for_manual_url_testing(
     assert splash.state.manual_entry_expanded is True
 
 
+async def test_splash_back_cancels_recovery_before_returning_to_hosts(
+    dummy_app: DummyAgentZeroCLI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recovery_started = asyncio.Event()
+
+    async def stale_recovery() -> None:
+        recovery_started.set()
+        await asyncio.Event().wait()
+
+    recovery_task = asyncio.create_task(stale_recovery())
+    dummy_app._websocket_recovery_task = recovery_task
+    await recovery_started.wait()
+    discovery_calls: list[bool] = []
+    focus_calls: list[bool] = []
+    monkeypatch.setattr(
+        dummy_app,
+        "_start_instance_discovery",
+        lambda *, auto_connect_single=False: discovery_calls.append(auto_connect_single),
+    )
+    monkeypatch.setattr(dummy_app, "_focus_splash_primary", lambda: focus_calls.append(True))
+
+    await dummy_app.on_splash_view_action_requested(SimpleNamespace(action="back"))
+
+    splash = dummy_app._test_widgets["#splash-view"]  # type: ignore[index]
+    assert recovery_task.cancelled()
+    assert dummy_app._websocket_recovery_task is None
+    assert splash.state.stage == "host"
+    assert discovery_calls == [False]
+    assert focus_calls == [True]
+
+
 async def test_startup_direct_connect_skips_instance_discovery(
     dummy_app: DummyAgentZeroCLI,
     monkeypatch: pytest.MonkeyPatch,
@@ -1251,6 +1445,24 @@ async def test_begin_connection_to_protected_instance_advances_to_login(
     }
     client = ProtectedClient()
     dummy_app.client = client  # type: ignore[assignment]
+    epoch_before_host_change = dummy_app._image_load_epoch
+    base_urls_when_cleared: list[str] = []
+    store = FakeImageStore()
+    store.clear = lambda: base_urls_when_cleared.append(client.base_url)  # type: ignore[method-assign]
+    dummy_app.image_store = store  # type: ignore[assignment]
+    recovery_cancelled_at: list[str] = []
+    recovery_started = asyncio.Event()
+
+    async def stale_recovery() -> None:
+        recovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            recovery_cancelled_at.append(client.base_url)
+
+    recovery_task = asyncio.create_task(stale_recovery())
+    dummy_app._websocket_recovery_task = recovery_task
+    await recovery_started.wait()
 
     async def fetch_capabilities() -> tuple[dict[str, object], bool, str]:
         return capabilities, False, ""
@@ -1270,6 +1482,11 @@ async def test_begin_connection_to_protected_instance_advances_to_login(
     status = dummy_app._test_widgets["#connection-status"]  # type: ignore[index]
     input_widget = dummy_app._test_widgets["#message-input"]  # type: ignore[index]
     assert client.base_url == "http://localhost:5080"
+    assert recovery_task.cancelled()
+    assert recovery_cancelled_at == [""]
+    assert dummy_app._websocket_recovery_task is None
+    assert base_urls_when_cleared == [""]
+    assert dummy_app._image_load_epoch == epoch_before_host_change + 1
     assert client.disconnect_calls == 1
     assert client.verify_session_calls == 1
     assert splash.state.stage == "login"
@@ -1518,6 +1735,382 @@ def test_context_event_status_updates_activity_lane_without_rendering_message(
     assert dummy_app.rendered_events == []
 
 
+def test_live_browser_screenshot_attaches_to_status_sequence(
+    dummy_app: DummyAgentZeroCLI,
+) -> None:
+    dummy_app.current_context = "ctx-1"
+
+    dummy_app._handle_context_event(
+        {
+            "context_id": "ctx-1",
+            "sequence": 8,
+            "event": "tool_start",
+            "data": {
+                "meta": {
+                    "_tool_name": "browser",
+                    "action": "screenshot",
+                    "browser_id": 1,
+                    "Screenshot": "img:///a0/tmp/history.jpg&t=1",
+                    "browser_snapshot": {
+                        "a0_path": "/a0/tmp/history.jpg",
+                        "browser_id": 1,
+                    },
+                }
+            },
+        }
+    )
+
+    log = dummy_app._test_widgets["#chat-log"]  # type: ignore[index]
+    assert log.image_entries[8][0].owner == "browser"
+
+
+def test_snapshot_attaches_user_and_assistant_history_images(
+    dummy_app: DummyAgentZeroCLI,
+) -> None:
+    dummy_app.current_context = "ctx-1"
+
+    dummy_app._handle_context_snapshot(
+        {
+            "context_id": "ctx-1",
+            "events": [
+                {
+                    "context_id": "ctx-1",
+                    "sequence": 2,
+                    "event": "user_message",
+                    "data": {"text": "scan", "meta": {"attachments": ["scan.png"]}},
+                },
+                {
+                    "context_id": "ctx-1",
+                    "sequence": 3,
+                    "event": "assistant_message",
+                    "data": {"text": "![result](img:///a0/usr/result.png)"},
+                },
+            ],
+        }
+    )
+
+    log = dummy_app._test_widgets["#chat-log"]  # type: ignore[index]
+    assert [log.image_entries[key][0].owner for key in (2, 3)] == ["user", "assistant"]
+
+
+def test_external_markdown_image_does_not_attach_to_live_response(
+    dummy_app: DummyAgentZeroCLI,
+) -> None:
+    dummy_app.current_context = "ctx-1"
+
+    dummy_app._handle_context_event(
+        {
+            "context_id": "ctx-1",
+            "sequence": 4,
+            "event": "assistant_message",
+            "data": {"text": "![external](https://example.test/image.png)"},
+        }
+    )
+
+    log = dummy_app._test_widgets["#chat-log"]  # type: ignore[index]
+    assert log.image_entries == {}
+
+
+class _TestImageRenderer:
+    mode = "halfcell"
+    notice = ""
+    max_surface_pixels = (192, 64)
+
+    def fit_box(self, *_args: object, **_kwargs: object):
+        from agent_zero_cli.image_render import CellBox
+
+        return CellBox(20, 10)
+
+    def create_widget(self, *_args: object, **_kwargs: object) -> SelectableStatic:
+        return SelectableStatic("image")
+
+    def cleanup_widget(self, widget: object | None) -> None:
+        if widget is not None:
+            widget.remove()  # type: ignore[union-attr]
+
+
+class _BlockingImageStore(FakeImageStore):
+    def __init__(self, asset: ImageAsset) -> None:
+        super().__init__()
+        self.asset = asset
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def load(self, reference: ImageReference) -> ImageAsset:
+        assert reference.context_id == "ctx-old"
+        self.started.set()
+        await self.release.wait()
+        return self.asset
+
+
+class _RecordingImageStore(FakeImageStore):
+    def __init__(self, asset: ImageAsset) -> None:
+        super().__init__()
+        self.asset = asset
+        self.load_calls: list[ImageReference] = []
+
+    async def load(self, reference: ImageReference) -> ImageAsset:
+        self.load_calls.append(reference)
+        return self.asset
+
+
+def _image_asset() -> ImageAsset:
+    image = PILImage.new("RGB", (12, 8), "#123456")
+    return ImageAsset("asset", "image/png", image, image.width, image.height, 288)
+
+
+async def test_image_load_result_is_ignored_after_context_switch() -> None:
+    asset = _image_asset()
+    closed: list[bool] = []
+    asset.close = lambda: closed.append(True)  # type: ignore[method-assign]
+    store = _BlockingImageStore(asset)
+    app = AgentZeroCLI(
+        config=CLIConfig(instance_url="http://agent.test"),
+        auto_connect_single_instance=False,
+        discover_instances=False,
+        image_renderer=_TestImageRenderer(),  # type: ignore[arg-type]
+    )
+    app.image_store = store  # type: ignore[assignment]
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.current_context = "ctx-old"
+        log = app.query_one(ChatLog)
+        reference = ImageReference(
+            entry_key="8:asset",
+            cache_key="asset",
+            context_id="ctx-old",
+            sequence=8,
+            owner="browser",
+            caption="Browser screenshot",
+            source="agent_zero_path",
+            value="/a0/tmp/history.png",
+        )
+        log.append_or_update_images(8, (reference,))
+        await pilot.pause()
+        entry = log.query_one(ImageEntry)
+        entry.request_load()
+        await store.started.wait()
+
+        app.current_context = "ctx-new"
+        store.release.set()
+        await pilot.pause()
+
+        assert entry.state == "loading"
+        assert closed == [True]
+
+
+async def test_queued_image_load_is_rejected_after_clear_before_store_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _RecordingImageStore(_image_asset())
+    app = AgentZeroCLI(
+        config=CLIConfig(instance_url="http://agent.test"),
+        auto_connect_single_instance=False,
+        discover_instances=False,
+        image_renderer=_TestImageRenderer(),  # type: ignore[arg-type]
+    )
+    app.image_store = store  # type: ignore[assignment]
+    queued: list[object] = []
+
+    def capture_image_worker(awaitable: object, *, name: str, **_kwargs: object) -> object:
+        if name == "load-image-entry":
+            queued.append(awaitable)
+        else:
+            awaitable.close()  # type: ignore[union-attr]
+        return object()
+
+    monkeypatch.setattr(
+        app,
+        "run_worker",
+        capture_image_worker,
+    )
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.current_context = "ctx-old"
+        log = app.query_one(ChatLog)
+        reference = ImageReference(
+            entry_key="8:asset",
+            cache_key="asset",
+            context_id="ctx-old",
+            sequence=8,
+            owner="browser",
+            caption="Browser screenshot",
+            source="agent_zero_path",
+            value="/a0/tmp/history.png",
+        )
+        log.append_or_update_images(8, (reference,))
+        await pilot.pause()
+        entry = log.query_one(ImageEntry)
+        entry.request_load()
+        await pilot.pause()
+
+        await app._cmd_clear()
+        await queued.pop()  # type: ignore[misc]
+
+        assert store.load_calls == []
+
+
+async def test_current_image_load_starts_store_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _RecordingImageStore(_image_asset())
+    app = AgentZeroCLI(
+        config=CLIConfig(instance_url="http://agent.test"),
+        auto_connect_single_instance=False,
+        discover_instances=False,
+        image_renderer=_TestImageRenderer(),  # type: ignore[arg-type]
+    )
+    app.image_store = store  # type: ignore[assignment]
+    queued: list[object] = []
+
+    def capture_image_worker(awaitable: object, *, name: str, **_kwargs: object) -> object:
+        if name == "load-image-entry":
+            queued.append(awaitable)
+        else:
+            awaitable.close()  # type: ignore[union-attr]
+        return object()
+
+    monkeypatch.setattr(
+        app,
+        "run_worker",
+        capture_image_worker,
+    )
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.current_context = "ctx-current"
+        log = app.query_one(ChatLog)
+        reference = ImageReference(
+            entry_key="9:asset",
+            cache_key="asset",
+            context_id="ctx-current",
+            sequence=9,
+            owner="browser",
+            caption="Browser screenshot",
+            source="agent_zero_path",
+            value="/a0/tmp/current.png",
+        )
+        log.append_or_update_images(9, (reference,))
+        await pilot.pause()
+        entry = log.query_one(ImageEntry)
+        entry.request_load()
+        await pilot.pause()
+
+        await queued.pop()  # type: ignore[misc]
+
+        assert store.load_calls == [reference]
+
+
+async def test_queued_image_load_is_rejected_during_disconnect_before_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingDisconnectClient:
+        def __init__(self) -> None:
+            self.base_url = "http://agent.test"
+            self.on_disconnect = object()
+            self.disconnect_started = asyncio.Event()
+            self.release_disconnect = asyncio.Event()
+
+        async def disconnect(self, *, close_http: bool = False) -> None:
+            assert close_http is False
+            self.disconnect_started.set()
+            await self.release_disconnect.wait()
+
+        async def logout(self) -> None:
+            return None
+
+        def clear_persisted_session(self, _host: str) -> None:
+            return None
+
+        def clear_session(self) -> None:
+            return None
+
+    store = _RecordingImageStore(_image_asset())
+    app = AgentZeroCLI(
+        config=CLIConfig(instance_url="http://agent.test"),
+        auto_connect_single_instance=False,
+        discover_instances=False,
+        image_renderer=_TestImageRenderer(),  # type: ignore[arg-type]
+    )
+    client = BlockingDisconnectClient()
+    app.client = client  # type: ignore[assignment]
+    app.image_store = store  # type: ignore[assignment]
+    queued: list[object] = []
+
+    def capture_image_worker(awaitable: object, *, name: str, **_kwargs: object) -> object:
+        if name == "load-image-entry":
+            queued.append(awaitable)
+        else:
+            awaitable.close()  # type: ignore[union-attr]
+        return object()
+
+    monkeypatch.setattr(app, "run_worker", capture_image_worker)
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        app.current_context = "ctx-current"
+        log = app.query_one(ChatLog)
+        reference = ImageReference(
+            entry_key="10:asset",
+            cache_key="asset",
+            context_id="ctx-current",
+            sequence=10,
+            owner="browser",
+            caption="Browser screenshot",
+            source="agent_zero_path",
+            value="/a0/tmp/current.png",
+        )
+        log.append_or_update_images(10, (reference,))
+        await pilot.pause()
+        log.query_one(ImageEntry).request_load()
+        await pilot.pause()
+
+        disconnect_task = asyncio.create_task(connection.disconnect_to_login(app))
+        await client.disconnect_started.wait()
+        await queued.pop()  # type: ignore[misc]
+
+        assert store.load_calls == []
+
+        client.release_disconnect.set()
+        await disconnect_task
+
+
+async def test_clear_and_context_switch_cancel_pending_image_loads(
+    dummy_app: DummyAgentZeroCLI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FakeImageStore()
+    dummy_app.image_store = store  # type: ignore[assignment]
+    epoch_before_clear = dummy_app._image_load_epoch
+    await dummy_app._cmd_clear()
+    assert store.cancel_calls == 1
+    assert dummy_app._image_load_epoch == epoch_before_clear + 1
+
+    async def async_noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    dummy_app.current_context = "ctx-old"
+    monkeypatch.setattr(dummy_app.client, "unsubscribe_context", async_noop)
+    monkeypatch.setattr(dummy_app.client, "subscribe_context", async_noop)
+    monkeypatch.setattr(dummy_app, "_hide_project_menu", async_noop)
+    monkeypatch.setattr(dummy_app, "_hide_profile_menu", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_context_tab_metadata", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_remote_tool_metadata", async_noop)
+    monkeypatch.setattr(dummy_app, "_publish_remote_tree_snapshot", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_projects", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_goal_bar", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_model_switcher", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_token_usage", async_noop)
+    monkeypatch.setattr(dummy_app, "_hide_project_menu", async_noop)
+    monkeypatch.setattr(dummy_app, "_hide_profile_menu", async_noop)
+    monkeypatch.setattr(dummy_app, "_stop_token_refresh", lambda: None)
+    monkeypatch.setattr(dummy_app, "_start_token_refresh", lambda: None)
+    monkeypatch.setattr(dummy_app, "_remember_context", lambda _context_id: None)
+    monkeypatch.setattr(dummy_app, "_clear_project_state", lambda: None)
+
+    await dummy_app._switch_context("ctx-new", has_messages_hint=False)
+    assert store.cancel_calls == 2
+    assert dummy_app._image_load_epoch == epoch_before_clear + 2
+
+
 def test_context_code_event_strips_icon_heading_from_activity_lane(
     dummy_app: DummyAgentZeroCLI,
 ) -> None:
@@ -1712,9 +2305,16 @@ async def test_composer_bars_stack_without_gaps() -> None:
         assert str(goal_bar._delete.label) == "× Delete"
         assert goal_bar._summary.render().plain.startswith("● Goal · ")
 
-        goal_bar.set_goal({"objective": "Ship goal support", "status": "paused"})
+        goal_bar.set_goal(
+            {
+                "objective": "Ship goal support",
+                "status": "paused",
+                "elapsed_seconds": 3_782,
+            }
+        )
         assert str(goal_bar._pause_resume.label) == "▶ Resume"
         assert goal_bar._summary.render().plain.startswith("● Goal paused · ")
+        assert goal_bar._summary.render().plain.endswith("1h3m2s")
 
 
 def test_chat_input_activity_placeholder_renders_detail_literally() -> None:
@@ -2005,6 +2605,115 @@ async def test_context_complete_surfaces_response_without_assistant_message(
     log = dummy_app._test_widgets["#chat-log"]  # type: ignore[index]
     assert log.writes == ["Command completed."]
     assert dummy_app._response_delivered is True
+
+
+async def test_context_complete_inserts_muted_duration_above_final_response(
+    dummy_app: DummyAgentZeroCLI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def async_noop(*args, **kwargs) -> None:
+        del args, kwargs
+
+    times = iter((100.0, 3_882.0))
+    monkeypatch.setattr(event_handlers, "monotonic", lambda: next(times))
+    monkeypatch.setattr(dummy_app, "_refresh_token_usage", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_goal_bar", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_context_tab_metadata", async_noop)
+    dummy_app.current_context = "ctx-alpha"
+
+    event_handlers.handle_context_event(
+        dummy_app,
+        {
+            "context_id": "ctx-alpha",
+            "event": "user_message",
+            "sequence": 1,
+            "data": {"text": "Go"},
+        },
+    )
+    event_handlers.handle_context_event(
+        dummy_app,
+        {
+            "context_id": "ctx-alpha",
+            "event": "assistant_message",
+            "sequence": 2,
+            "data": {"text": "Done"},
+        },
+    )
+    event_handlers.handle_context_complete(dummy_app, {"context_id": "ctx-alpha"})
+    await asyncio.sleep(0)
+
+    log = dummy_app._test_widgets["#chat-log"]  # type: ignore[index]
+    assert log.before_writes[0][0] == 2
+    completion = log.before_writes[0][1]
+    assert isinstance(completion, Text)
+    assert completion.plain == "Completed in 1h3m2s"
+    assert str(completion.style) == "#7f8c98"
+
+
+async def test_context_complete_notifies_terminal_once_for_active_run(
+    dummy_app: DummyAgentZeroCLI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def async_noop(*args, **kwargs) -> None:
+        del args, kwargs
+
+    writes: list[str] = []
+    dummy_app.current_context = "ctx-alpha"
+    dummy_app.agent_active = True
+    dummy_app._driver = SimpleNamespace(write=writes.append)  # type: ignore[assignment]
+    monkeypatch.setattr(event_handlers, "completion_notification_sequence", lambda **kwargs: "notify")
+    monkeypatch.setattr(dummy_app, "_refresh_token_usage", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_goal_bar", async_noop)
+    monkeypatch.setattr(dummy_app, "_refresh_context_tab_metadata", async_noop)
+
+    event_handlers.handle_context_complete(dummy_app, {"context_id": "ctx-other"})
+    event_handlers.handle_context_complete(dummy_app, {"context_id": "ctx-alpha"})
+    event_handlers.handle_context_complete(dummy_app, {"context_id": "ctx-alpha"})
+    await asyncio.sleep(0)
+
+    assert writes == ["notify"]
+
+
+def test_completion_notification_selects_protocol_and_terminal_guards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent_zero_cli.rendering.os.getpid", lambda: 1234)
+
+    assert completion_notification_sequence(is_tty=False, environ={}) == ""
+    for disabled in ("0", "false", "NO", " off "):
+        assert (
+            completion_notification_sequence(
+                is_tty=True,
+                environ={"A0_TERMINAL_NOTIFY": disabled},
+            )
+            == ""
+        )
+    assert completion_notification_sequence(
+        is_tty=True,
+        environ={"KITTY_WINDOW_ID": "1"},
+    ) == (
+        "\x1b]99;i=a0-1234:d=0;Agent Zero\x1b\\"
+        "\x1b]99;i=a0-1234:d=1:p=body;Ready for input\x1b\\"
+    )
+    assert completion_notification_sequence(
+        is_tty=True,
+        environ={"TERM_PROGRAM": "iTerm.app"},
+    ) == "\x1b]9;Agent Zero: Ready for input\x1b\\"
+    assert completion_notification_sequence(is_tty=True, environ={}) == (
+        "\x1b]777;notify;Agent Zero;Ready for input\x07"
+    )
+    assert completion_notification_sequence(
+        is_tty=True,
+        environ={"TMUX": "/tmp/tmux"},
+    ) == (
+        "\x1bPtmux;\x1b\x1b]777;notify;Agent Zero;Ready for input\x07\x1b\\"
+    )
+
+
+def test_duration_format_includes_hours_minutes_and_seconds() -> None:
+    assert format_duration(45) == "45s"
+    assert format_duration(62) == "1m2s"
+    assert format_duration(3_782) == "1h3m2s"
 
 
 async def test_context_tabs_render_in_textual() -> None:
@@ -2636,16 +3345,18 @@ async def test_attach_command_uploads_local_image_paths(
     assert notices == [("Attached 2 images.", False)]
 
 
-async def test_clear_command_clears_visible_chat_log(
+async def test_clear_command_keeps_intro_and_clears_visible_chat_log(
     dummy_app: DummyAgentZeroCLI,
 ) -> None:
     log = dummy_app._test_widgets["#chat-log"]  # type: ignore[index]
     input_widget = dummy_app._test_widgets["#message-input"]  # type: ignore[index]
+    log.intro_visible = True
     input_widget.set_activity("Working")
 
     await dummy_app._dispatch_command("/clear")
 
     assert log.cleared is True
+    assert log.intro_visible is True
     assert input_widget.activity_idle is True
 
 
@@ -2916,6 +3627,94 @@ def test_raw_skill_command_detection() -> None:
     assert is_raw_skill_command("$") is False
     assert is_raw_skill_command("$100") is False
     assert is_raw_skill_command("please use $imagegen") is False
+
+
+def test_reference_query_detection_uses_the_composer_cursor() -> None:
+    value = "Compare @src/app with the current file"
+    cursor = len("Compare @src/app")
+
+    assert reference_query_at_cursor(value, cursor) == ("@src/app", 8, cursor)
+    assert reference_query_at_cursor("mail@example.test", len("mail@example.test")) is None
+    assert reference_query_at_cursor("Use @[./src/app.py] ", 21) is None
+
+
+def test_container_reference_directory_stays_under_the_active_workspace() -> None:
+    root = "/a0/usr/workdir/project"
+
+    assert _container_reference_directory("@/", root) == ""
+    assert _container_reference_directory("@/a0/usr/workdir/project/src/", root) == "src"
+    assert _container_reference_directory("@/a0/usr/workdir/project/../secret", root) is None
+    assert _container_reference_directory("@/a0/usr/other", root) is None
+
+
+def test_scoped_reference_catalog_excludes_disabled_profiles_hidden_skills_and_blocked_mcps() -> None:
+    catalog = _scoped_reference_catalog(
+        [
+            {"id": "researcher", "title": "Researcher", "enabled": True, "available": True},
+            {"id": "disabled", "title": "Disabled", "enabled": False, "available": True},
+            {"id": "missing", "title": "Missing", "enabled": True, "available": False},
+        ],
+        {
+            "skills": {
+                "catalog": [
+                    {"name": "visible", "description": "Visible skill", "path": "/a0/skills/visible"},
+                    {"name": "hidden", "hidden": True},
+                ]
+            },
+            "tools": {
+                "effective_policy": {
+                    "mode": "custom",
+                    "mcp_default": "block",
+                    "allowed": ["mcp:enabled:search"],
+                    "blocked": ["mcp:blocked:read"],
+                },
+                "catalog": [
+                    {"id": "mcp:enabled:search"},
+                    {"id": "mcp:blocked:read"},
+                    {"id": "mcp:unavailable:read", "available": False},
+                ],
+            },
+        },
+    )
+
+    assert [item[0] for item in catalog] == [
+        "@[agent/researcher]",
+        "@[skill/visible]",
+        "@[mcp/enabled]",
+    ]
+
+
+def test_container_reference_hit_uses_literal_bracketed_text() -> None:
+    class Client:
+        async def get_chat_files_path(self, _context_id: str) -> str:
+            return "/a0/usr/workdir"
+
+        async def list_container_reference_entries(
+            self,
+            _root: str,
+            _directory: str,
+        ) -> list[dict[str, object]]:
+            return [{"name": "demo", "path": "/a0/usr/workdir/demo", "is_dir": False}]
+
+    async def collect() -> list[object]:
+        app = SimpleNamespace(
+            client=Client(),
+            current_context="ctx-1",
+            connector_features=set(),
+            _remote_files=SimpleNamespace(list_reference_entries=lambda _directory: []),
+            _reference_palette_range=None,
+            _insert_reference=lambda *_args: None,
+        )
+        provider = SimpleNamespace(app=app, matcher=lambda query: Matcher(query))
+        return [
+            hit
+            async for hit in OrderedSystemCommandsProvider._search_reference_targets(provider, "@/")
+        ]
+
+    hits = asyncio.run(collect())
+
+    assert len(hits) == 1
+    assert hits[0].text == "@[/a0/usr/workdir/demo]"
 
 
 def test_bare_dollar_auto_opens_skill_palette(
@@ -3948,6 +4747,8 @@ async def test_computer_use_slash_commands_refresh_hello_metadata_when_connected
             },
             "host_browser": _host_browser_metadata(False),
             "remote_files": {
+                "file_browser": 1,
+                "root_path": dummy_app._remote_files.scan_root,
                 "enabled": True,
                 "write_enabled": True,
                 "mode": "read_write",
@@ -3969,6 +4770,8 @@ async def test_computer_use_slash_commands_refresh_hello_metadata_when_connected
             },
             "host_browser": _host_browser_metadata(False),
             "remote_files": {
+                "file_browser": 1,
+                "root_path": dummy_app._remote_files.scan_root,
                 "enabled": True,
                 "write_enabled": True,
                 "mode": "read_write",
@@ -4539,6 +5342,8 @@ async def test_remote_safety_toggles_refresh_hello_metadata_when_connected(
             "computer_use": computer_use_metadata,
             "host_browser": _host_browser_metadata(False),
             "remote_files": {
+                "file_browser": 1,
+                "root_path": dummy_app._remote_files.scan_root,
                 "enabled": True,
                 "write_enabled": False,
                 "mode": "read_only",
@@ -4552,6 +5357,8 @@ async def test_remote_safety_toggles_refresh_hello_metadata_when_connected(
             "computer_use": computer_use_metadata,
             "host_browser": _host_browser_metadata(False),
             "remote_files": {
+                "file_browser": 1,
+                "root_path": dummy_app._remote_files.scan_root,
                 "enabled": True,
                 "write_enabled": False,
                 "mode": "read_only",
@@ -4829,6 +5636,9 @@ async def test_recover_websocket_preserves_active_context(
             self.connect_calls = 0
             self.hello_calls: list[dict[str, object]] = []
             self.subscribe_calls: list[str] = []
+            # A0Client exposes base_url; the recovery loop watches it to stop
+            # when the user reconnects to a different host meanwhile.
+            self.base_url = "http://agent.test"
 
         async def connect_websocket(self) -> None:
             self.connect_calls += 1
@@ -4906,6 +5716,164 @@ async def test_recover_websocket_preserves_active_context(
     assert status.status == "connected"
     assert splash.state.stage == "ready"
     assert splash.state.message == "Reconnected."
+
+
+async def test_recover_websocket_retries_past_bounded_delays(
+    dummy_app: DummyAgentZeroCLI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FlakyClient:
+        def __init__(self) -> None:
+            self.base_url = "http://agent.test"
+            self.connect_calls = 0
+
+        async def connect_websocket(self) -> None:
+            self.connect_calls += 1
+            if self.connect_calls < 4:
+                raise ConnectionError("refused")
+
+        async def send_hello(self, **payload: object) -> dict[str, object]:
+            return {"exec_config": {"version": 1}}
+
+        async def subscribe_context(self, context_id: str, **kwargs) -> dict[str, object]:
+            del kwargs
+            return {}
+
+    class FakePythonTty:
+        def set_exec_config(self, config: object) -> None:
+            del config
+
+    client = FlakyClient()
+    monkeypatch.setattr("agent_zero_cli.connection._RECOVERY_DELAYS_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr("agent_zero_cli.connection._RECOVERY_STEADY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(dummy_app, "_stop_remote_tree_publisher", lambda: None)
+    monkeypatch.setattr(dummy_app, "_start_remote_tree_publisher", lambda: None)
+
+    async def fake_publish_remote_tree_snapshot(**kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        dummy_app, "_publish_remote_tree_snapshot", fake_publish_remote_tree_snapshot
+    )
+    stages: list[str] = []
+    original_set_splash_stage = dummy_app._set_splash_stage
+
+    def record_splash_stage(stage: str, **kwargs: object) -> None:
+        stages.append(stage)
+        original_set_splash_stage(stage, **kwargs)
+
+    monkeypatch.setattr(dummy_app, "_set_splash_stage", record_splash_stage)
+
+    dummy_app.config.instance_url = "http://agent.test"
+    dummy_app.client = client  # type: ignore[assignment]
+    dummy_app._python_tty = FakePythonTty()  # type: ignore[assignment]
+    dummy_app.connected = True
+    dummy_app.agent_active = True
+    dummy_app.current_context = "ctx-1"
+    dummy_app.current_context_has_messages = True
+    dummy_app._context_run_complete = False
+
+    await connection._recover_websocket(dummy_app)
+
+    # Two bounded delays are configured, but recovery must keep trying on the
+    # steady cadence instead of giving up after exhausting them.
+    assert client.connect_calls == 4
+    assert dummy_app.connected is True
+    assert stages == ["connecting", "connecting", "error", "error", "ready"]
+
+
+async def test_recover_websocket_stops_when_host_changes(
+    dummy_app: DummyAgentZeroCLI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class HostChangingClient:
+        def __init__(self) -> None:
+            self.base_url = "http://agent.test"
+            self.connect_calls = 0
+            self.hello_calls = 0
+
+        async def connect_websocket(self) -> None:
+            self.connect_calls += 1
+            # The user connected to a different host meanwhile; that
+            # connection owns the client now.
+            self.base_url = "http://other.test"
+            raise ConnectionError("stale connection")
+
+        async def send_hello(self, **payload: object) -> dict[str, object]:
+            self.hello_calls += 1
+            return {}
+
+    client = HostChangingClient()
+    monkeypatch.setattr("agent_zero_cli.connection._RECOVERY_DELAYS_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr("agent_zero_cli.connection._RECOVERY_STEADY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(dummy_app, "_stop_remote_tree_publisher", lambda: None)
+
+    dummy_app.config.instance_url = "http://agent.test"
+    dummy_app.client = client  # type: ignore[assignment]
+    dummy_app.connected = False
+    dummy_app.agent_active = False
+    dummy_app.current_context = "ctx-1"
+    dummy_app.current_context_has_messages = True
+    dummy_app._context_run_complete = False
+
+    await connection._recover_websocket(dummy_app)
+
+    assert client.connect_calls == 1
+    assert client.hello_calls == 0
+    assert dummy_app._websocket_recovery_task is None
+
+
+async def test_recover_websocket_rechecks_host_after_sleep(
+    dummy_app: DummyAgentZeroCLI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingClient:
+        def __init__(self) -> None:
+            self.base_url = "http://agent.test"
+            self.connect_calls = 0
+            self.hello_calls = 0
+
+        async def connect_websocket(self) -> None:
+            self.connect_calls += 1
+            raise ConnectionError("refused")
+
+        async def send_hello(self, **payload: object) -> dict[str, object]:
+            self.hello_calls += 1
+            return {}
+
+    client = FailingClient()
+    monkeypatch.setattr("agent_zero_cli.connection._RECOVERY_DELAYS_SECONDS", (0.0, 0.0))
+    monkeypatch.setattr("agent_zero_cli.connection._RECOVERY_STEADY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(dummy_app, "_stop_remote_tree_publisher", lambda: None)
+
+    sleep_calls = 0
+
+    async def fake_sleep(delay: float) -> None:
+        del delay
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 2:
+            # The host switch lands while recovery is asleep: begin_connection
+            # updates client.base_url immediately but the context only later,
+            # so the post-sleep guard must re-check base_url, not just context.
+            client.base_url = "http://other.test"
+
+    monkeypatch.setattr("agent_zero_cli.connection.asyncio.sleep", fake_sleep)
+
+    dummy_app.config.instance_url = "http://agent.test"
+    dummy_app.client = client  # type: ignore[assignment]
+    dummy_app.connected = False
+    dummy_app.agent_active = False
+    dummy_app.current_context = "ctx-1"
+    dummy_app.current_context_has_messages = True
+    dummy_app._context_run_complete = False
+
+    await connection._recover_websocket(dummy_app)
+
+    assert sleep_calls == 2
+    assert client.connect_calls == 1
+    assert client.hello_calls == 0
+    assert dummy_app._websocket_recovery_task is None
 
 
 def test_copy_to_clipboard_mirrors_to_native_windows_clipboard(
@@ -5026,7 +5994,9 @@ async def test_chat_log_regular_entries_copy_selected_text() -> None:
         )
         await pilot.pause()
 
-        widget = log._seq_to_widget[1]
+        entry = log._seq_to_widget[1]
+        assert isinstance(entry, TranscriptEntry)
+        widget = entry.primary
         assert isinstance(widget, SelectableStatic)
 
         app.screen.selections = {widget: SELECT_ALL}
@@ -5043,7 +6013,8 @@ async def test_chat_log_caches_rendered_content_until_updated() -> None:
         log.append_or_update(1, Panel("First version", padding=(0, 1)))
         await pilot.pause()
 
-        widget = log._seq_to_widget[1]
+        widget = log._seq_to_widget[1].primary
+        assert isinstance(widget, SelectableStatic)
         first = widget.render()
         assert widget.render() is first
         assert hasattr(widget._render_cache, "lines")
@@ -5068,10 +6039,46 @@ async def test_chat_log_prepends_older_history_before_loaded_entries() -> None:
             )
         await pilot.pause()
 
-        timeline = [child for child in log.children if isinstance(child, SelectableStatic)]
+        timeline = [child for child in log.children if isinstance(child, TranscriptEntry)]
         assert "older message 1" in timeline[0].copy_text()
         assert "older message 2" in timeline[1].copy_text()
         assert "newer message" in timeline[2].copy_text()
+
+
+async def test_chat_log_inserts_completion_immediately_before_response() -> None:
+    app = TranscriptSelectionApp()
+
+    async with app.run_test() as pilot:
+        log = app.query_one("#chat-log", ChatLog)
+        log.append_or_update(7, Panel("Final response", padding=(0, 1)))
+        log.write_before(7, Text("Completed in 1m2s", style="#7f8c98"))
+        await pilot.pause()
+
+        timeline = [child for child in log.children if isinstance(child, TranscriptEntry)]
+        assert timeline[-2].copy_text() == "Completed in 1m2s"
+        assert "Final response" in timeline[-1].copy_text()
+
+
+async def test_chat_log_clear_preserves_only_banner_and_initial_greeting() -> None:
+    app = TranscriptSelectionApp()
+
+    async with app.run_test() as pilot:
+        log = app.query_one("#chat-log", ChatLog)
+        log.ensure_intro_banner()
+        render_connector_event(
+            log,
+            {"event": "assistant_message", "sequence": "1", "data": {"text": "Welcome"}},
+        )
+        log.append_or_update(2, Panel("Conversation", padding=(0, 1)))
+        await pilot.pause()
+
+        log.clear(preserve_intro=True)
+        await pilot.pause()
+
+        assert set(log._seq_to_widget) == {1}
+        assert log._intro_widget in log.children
+        assert "Welcome" in log.copyable_text(visible_only=False)
+        assert "Conversation" not in log.copyable_text(visible_only=False)
 
 
 async def test_chat_log_requests_another_history_page_only_once(
@@ -5112,6 +6119,8 @@ async def test_chat_log_copyable_text_prefers_visible_children() -> None:
                 Panel(f"copyable row {sequence}", border_style="#555555", padding=(0, 1)),
             )
         await pilot.pause()
+        log.scroll_end(animate=False, immediate=True)
+        await pilot.pause()
 
         visible_text = log.copyable_text(visible_only=True)
         all_text = log.copyable_text(visible_only=False)
@@ -5134,7 +6143,8 @@ async def test_chat_log_nested_plain_strings_render_brackets_literally() -> None
         )
         await pilot.pause()
 
-        widget = log._seq_to_widget[1]
+        widget = log._seq_to_widget[1].primary
+        assert isinstance(widget, SelectableStatic)
         assert path_like_text in widget.render().plain
 
 
@@ -5164,7 +6174,9 @@ async def test_connector_events_render_markup_sensitive_text_literally() -> None
         await pilot.pause()
 
         transcript = "\n".join(
-            widget.render().plain for widget in log._seq_to_widget.values()
+            widget.primary.render().plain
+            for widget in log._seq_to_widget.values()
+            if widget.primary is not None
         )
 
     assert transcript.count(path_like_text) == len(events)
@@ -5193,7 +6205,8 @@ async def test_connector_code_event_renders_compact_details() -> None:
         assert rendered is True
         await pilot.pause()
 
-        widget = log._seq_to_widget[1]
+        widget = log._seq_to_widget[1].primary
+        assert isinstance(widget, SelectableStatic)
         transcript = widget.render().plain
 
     assert "Running code" in transcript
@@ -5214,7 +6227,8 @@ async def test_chat_log_render_width_respects_scrollbar_gutter() -> None:
             )
         await pilot.pause()
 
-        widget = log._seq_to_widget[19]
+        widget = log._seq_to_widget[19].primary
+        assert isinstance(widget, SelectableStatic)
         lines = widget.render().plain.splitlines()
 
         assert widget.size.width < log.size.width
@@ -5238,7 +6252,8 @@ async def test_chat_log_status_entries_copy_selected_text() -> None:
         )
         await pilot.pause()
 
-        widget = log._seq_to_widget[2]
+        widget = log._seq_to_widget[2].primary
+        assert isinstance(widget, SelectableStatic)
         widget.action_toggle()
         await pilot.pause()
         app.screen.selections = {widget: SELECT_ALL}
@@ -5257,7 +6272,8 @@ async def test_chat_log_selection_ctrl_c_copies_without_triggering_quit() -> Non
         log.append_or_update(3, Panel("Ctrl+C should copy this selection", border_style="#555555", padding=(0, 1)))
         await pilot.pause()
 
-        widget = log._seq_to_widget[3]
+        widget = log._seq_to_widget[3].primary
+        assert isinstance(widget, SelectableStatic)
         widget.focus()
         app.screen.selections = {widget: SELECT_ALL}
         await pilot.press("ctrl+c")

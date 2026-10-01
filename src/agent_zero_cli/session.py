@@ -105,6 +105,8 @@ class ConnectorSession:
         remote_files_enabled: bool = True,
         remote_exec_enabled: bool = True,
         tools_only: bool = False,
+        defer_context: bool = False,
+        remember_context: bool = True,
         gateway: dict[str, Any] | None = None,
         host_browser_manager: HostBrowserManager | None = None,
         computer_use_manager: ComputerUseManager | None = None,
@@ -120,6 +122,8 @@ class ConnectorSession:
         self.remote_files_enabled = remote_files_enabled
         self.remote_exec_enabled = remote_exec_enabled
         self.tools_only = tools_only
+        self.defer_context = defer_context
+        self.remember_context = remember_context
         self.gateway = dict(gateway or {})
         self.gateway_enabled = bool(gateway)
         self.master_enabled = bool(self.gateway.get("master_enabled", True))
@@ -138,6 +142,14 @@ class ConnectorSession:
             enabled=self.remote_exec_enabled,
             allow_writes=self.remote_file_write_enabled,
         )
+        from .host_control import HostControl
+        from .host_viewer import HostViewer
+        from .config import _ENV_DIR
+        import hashlib
+        identity = hashlib.sha256(str(self.gateway.get("id", "session")).encode()).hexdigest()[:32]
+        self.host_control = HostControl(_ENV_DIR / "host-control" / (identity + ".json"))
+        self.host_viewer = HostViewer(self, self.host_control)
+        self.setup_verifications = {}
         self.client: A0Client | None = None
         self.capabilities: dict[str, Any] = {}
         self.connector_features: set[str] = set()
@@ -165,6 +177,7 @@ class ConnectorSession:
         context_id: str = "",
         chat_last: bool = False,
         new_chat: bool = False,
+        new_chat_agent_profile: str = "",
         restore_session: bool = True,
     ) -> str:
         await self._reset_runtime()
@@ -178,6 +191,7 @@ class ConnectorSession:
         capabilities = await self._fetch_and_validate_capabilities(client)
         self.capabilities = capabilities
         self.connector_features = set(capabilities.get("features") or [])
+        self.host_control.enabled = self.gateway_enabled and "host_viewer_v1" in self.connector_features
         if self.tools_only and not {
             "launcher_gateway",
             "launcher_gateway_file_write",
@@ -239,12 +253,21 @@ class ConnectorSession:
             self._notify_gateway_state_change()
             return ""
 
+        if self.defer_context:
+            self.connected = True
+            await self.refresh_remote_tool_metadata()
+            await self.publish_remote_tree_snapshot(force=True)
+            self._start_remote_tree_publisher()
+            self._stage("ready", "Connector ready for a chat context.", normalized_host)
+            return ""
+
         self._stage("connecting", "Resolving chat context...", normalized_host)
         try:
             resolved_context_id, has_messages_hint = await self._resolve_initial_context(
                 requested_context_id=context_id,
                 chat_last=chat_last,
                 new_chat=new_chat,
+                new_chat_agent_profile=new_chat_agent_profile,
             )
             self.context_id = resolved_context_id
             self.context_has_messages = has_messages_hint
@@ -265,7 +288,8 @@ class ConnectorSession:
             ) from exc
 
         self.connected = True
-        self._remember_context(resolved_context_id)
+        if self.remember_context:
+            self._remember_context(resolved_context_id)
         self._start_remote_tree_publisher()
         self._stage("ready", "Ready when you are.", normalized_host)
         if warning := connector_version_warning(capabilities):
@@ -425,7 +449,8 @@ class ConnectorSession:
         await client.subscribe_context(normalized_context_id, from_seq=0)
         await self.refresh_remote_tool_metadata()
         await self.publish_remote_tree_snapshot(force=True)
-        self._remember_context(normalized_context_id)
+        if self.remember_context:
+            self._remember_context(normalized_context_id)
         self._stage("ready", "Switched chat.", normalized_context_id)
 
     async def refresh_context_snapshot(self) -> None:
@@ -582,10 +607,13 @@ class ConnectorSession:
         requested_context_id: str,
         chat_last: bool,
         new_chat: bool,
+        new_chat_agent_profile: str = "",
     ) -> tuple[str, bool]:
         client = self._require_client()
         if new_chat:
-            return await client.create_chat(), False
+            return await client.create_chat(
+                agent_profile=str(new_chat_agent_profile or "").strip() or None,
+            ), False
 
         default_context_id = str(requested_context_id or "").strip()
         if not default_context_id and not chat_last:
@@ -642,7 +670,9 @@ class ConnectorSession:
         self._notify_gateway_state_change()
 
     def _handle_disconnect(self) -> None:
+        self.setup_verifications.clear()
         self.connected = False
+        self.host_control.hold()
         self._notify_gateway_state_change()
         if self._emergency_disconnected:
             return
@@ -708,6 +738,14 @@ class ConnectorSession:
         return bool(scopes.get(scope))
 
     async def _handle_file_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_file_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_file_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("files"):
             return {
                 "op_id": data.get("op_id", ""),
@@ -715,9 +753,20 @@ class ConnectorSession:
                 "error": "Launcher host file access is paused.",
                 "code": "HOST_FILES_DISABLED",
             }
-        return self.remote_files.handle_file_op(data)
+        def check_access():
+            if not self._scope_available("files"):
+                raise PermissionError("Launcher host file access is paused.")
+        return await self.remote_files.handle_file_op_async(data, self.client, check_access)
 
     async def _handle_exec_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_exec_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_exec_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("code_execution"):
             return {
                 "op_id": data.get("op_id", ""),
@@ -728,6 +777,14 @@ class ConnectorSession:
         return await self.remote_exec.handle_exec_op(data)
 
     async def _handle_computer_use_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_computer_use_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_computer_use_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("computer_use"):
             return _unsupported_result(
                 data,
@@ -739,6 +796,20 @@ class ConnectorSession:
         return await self.computer_use.handle_op(data)
 
     async def _handle_browser_op(self, data: dict[str, Any]) -> dict[str, Any]:
+        if data.get("action") == "_host_viewer":
+            try:
+                result = await self.host_viewer.handle(data)
+                return {"op_id": data.get("op_id"), "ok": True, "result": result}
+            except Exception as exc:
+                return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_CONTROL", "error": str(exc)}
+        from .host_control import ControlError
+        try:
+            async with self.host_control.operation(data):
+                return await self._unfenced_browser_op(data)
+        except ControlError as exc:
+            return {"op_id": data.get("op_id"), "ok": False, "code": "HOST_HELD", "error": str(exc)}
+
+    async def _unfenced_browser_op(self, data: dict[str, Any]) -> dict[str, Any]:
         if not self._scope_available("browser"):
             return _unsupported_result(data, tool="Host browser", code="HOST_BROWSER_DISABLED")
         if self.host_browser is None:
@@ -755,6 +826,8 @@ class ConnectorSession:
         _request: dict[str, Any],
         _result: dict[str, Any],
     ) -> None:
+        if _request.get("action") == "_host_viewer":
+            return
         await self.refresh_remote_tool_metadata()
         self._notify_gateway_state_change()
 
@@ -837,12 +910,14 @@ class ConnectorSession:
         return self._gateway_scopes()
 
     async def set_gateway_master(self, enabled: bool) -> None:
+        self.setup_verifications.clear()
         self.master_enabled = bool(enabled)
         self.gateway["master_enabled"] = self.master_enabled
         await self._close_disabled_gateway_sessions()
         self._notify_gateway_state_change()
 
     async def _close_disabled_gateway_sessions(self) -> None:
+        self.setup_verifications.clear()
         scopes = self._gateway_scopes()
         if not self.master_enabled or not scopes["code_execution"]:
             await self.remote_exec.close()
@@ -872,11 +947,14 @@ class ConnectorSession:
             ],
             "status": {},
         }
+        if self.host_control.enabled:
+            metadata["features"].append("host_viewer_v1")
         browser = self._host_browser_metadata()
         computer = self._computer_use_metadata()
         status_details: dict[str, Any] = {
             "browser": browser,
             "computer_use": computer,
+            "setup_verifications": dict(self.setup_verifications),
         }
         state = "connected" if self.connected else "connecting"
         browser_status = str(browser.get("status", "") or "").lower()
@@ -909,6 +987,8 @@ class ConnectorSession:
         if self._emergency_disconnected:
             state = "disconnected"
         metadata["state"] = state
+        if self.host_control.enabled:
+            status_details["host_control"] = self.host_control.snapshot()
         metadata["status"] = status_details
         return metadata
 
@@ -956,6 +1036,8 @@ class ConnectorSession:
     def _remote_file_metadata(self) -> dict[str, Any]:
         enabled = self._scope_available("files")
         return {
+            "file_browser": 1,
+            "root_path": self.remote_files.scan_root,
             "enabled": enabled,
             "write_enabled": enabled and self.remote_file_write_enabled,
             "mode": "read_write" if enabled and self.remote_file_write_enabled else "read_only",
@@ -985,7 +1067,9 @@ class ConnectorSession:
     async def _recover_websocket(self) -> None:
         client = self.client
         context_id = self.context_id
-        if client is None or not self.host or (not self.tools_only and not context_id):
+        if client is None or not self.host or (
+            not self.tools_only and not self.defer_context and not context_id
+        ):
             self._recovery_task = None
             self.agent_active = False
             self.observer.on_disconnect()
@@ -1001,7 +1085,7 @@ class ConnectorSession:
                 )
                 await asyncio.sleep(delay)
                 if self.client is not client or (
-                    not self.tools_only and not self.context_id
+                    not self.tools_only and not self.defer_context and not self.context_id
                 ):
                     return
                 try:
@@ -1016,7 +1100,7 @@ class ConnectorSession:
                     )
                     exec_config = hello.get("exec_config") if isinstance(hello, dict) else None
                     self.remote_exec.set_exec_config(exec_config)
-                    if not self.tools_only:
+                    if not self.tools_only and context_id:
                         await client.subscribe_context(context_id)
                     await self.publish_remote_tree_snapshot(force=True)
                 except asyncio.CancelledError:

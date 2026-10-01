@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 
+from rich.text import Text
 from textual.css.query import NoMatches
 
 from agent_zero_cli.rendering import (
     _EVENT_CATEGORY,
     _STATUS_LABEL,
+    completion_notification_sequence,
     extract_detail,
+    format_duration,
     render_connector_event,
 )
+from agent_zero_cli.media_refs import extract_image_references
 from agent_zero_cli.widgets import ChatInput
 from agent_zero_cli.widgets.chat_log import ChatLog
 
@@ -29,6 +34,22 @@ def _chat_log_or_none(app: AgentZeroCLI) -> ChatLog | None:
         return None
 
 
+def _notify_terminal_completion(app: AgentZeroCLI) -> None:
+    if getattr(app, "is_headless", False) or getattr(app, "is_web", False):
+        return
+    stdout = sys.__stdout__
+    sequence = completion_notification_sequence(
+        is_tty=bool(stdout and getattr(stdout, "isatty", lambda: False)())
+    )
+    driver = getattr(app, "_driver", None)
+    if not sequence or driver is None:
+        return
+    try:
+        driver.write(sequence)
+    except Exception:
+        pass
+
+
 def _remember_user_message(app: AgentZeroCLI, event: dict[str, Any]) -> None:
     if event.get("event") != "user_message":
         return
@@ -44,6 +65,20 @@ def _remember_user_message(app: AgentZeroCLI, event: dict[str, Any]) -> None:
         app.query_one("#message-input", ChatInput).seed_history([text])
     except Exception:
         return
+
+
+def _append_event_images(
+    app: AgentZeroCLI,
+    log: ChatLog,
+    event: dict[str, Any],
+    *,
+    prepend: bool = False,
+) -> None:
+    """Attach normalized media after the owning event has established its entry."""
+    references = extract_image_references(event, base_url=app.client.base_url)
+    if not references:
+        return
+    log.append_or_update_images(references[0].sequence, references, prepend=prepend)
 
 
 async def _compaction_context_reload(app: AgentZeroCLI, context_id: str) -> None:
@@ -72,6 +107,9 @@ def handle_context_snapshot(app: AgentZeroCLI, data: dict[str, Any]) -> None:
         app._set_message_queue(queue_items)
 
     prepend = "history_before" in data and bool(log._seq_to_widget)
+    if "history_before" not in data:
+        app._run_started_at = None
+        app._last_response_sequence = None
     if "history_before" in data:
         log.set_history_page(
             before=int(data.get("history_before") or 0),
@@ -113,6 +151,7 @@ def handle_context_snapshot(app: AgentZeroCLI, data: dict[str, Any]) -> None:
                     active=False,
                     **({"prepend": True} if prepend else {}),
                 )
+        _append_event_images(app, log, event, prepend=prepend)
 
     app._sync_body_mode()
 
@@ -146,6 +185,12 @@ def handle_context_event(app: AgentZeroCLI, data: dict[str, Any]) -> None:
 
     post_complete = app._context_run_complete
 
+    if event_type == "user_message":
+        app._run_started_at = monotonic()
+        app._last_response_sequence = None
+    elif not post_complete and app._run_started_at is None and category != "response":
+        app._run_started_at = monotonic()
+
     if not app._pause_latched and not post_complete:
         app.agent_active = True
         app._sync_ready_actions()
@@ -155,7 +200,12 @@ def handle_context_event(app: AgentZeroCLI, data: dict[str, Any]) -> None:
         app._focus_message_input()
         app._set_idle()
         app._show_chat_intro(log, category)
-        render_connector_event(log, data)
+        if render_connector_event(log, data):
+            try:
+                app._last_response_sequence = int(sequence)
+            except (TypeError, ValueError):
+                app._last_response_sequence = None
+        _append_event_images(app, log, data)
         if app._compaction_refresh_context == context_id and event_type == "assistant_message":
             app._compaction_refresh_context = None
             asyncio.create_task(_compaction_context_reload(app, context_id))
@@ -189,11 +239,30 @@ def handle_context_event(app: AgentZeroCLI, data: dict[str, Any]) -> None:
         if render_connector_event(log, data) and log._active_seq == data.get("sequence"):
             log.stop_active_status()
 
+    _append_event_images(app, log, data)
+
 
 def handle_context_complete(app: AgentZeroCLI, data: dict[str, Any]) -> None:
     context_id = data.get("context_id", "")
     if context_id != app.current_context:
         return
+
+    was_active = app.agent_active
+    started_at = app._run_started_at
+    response_sequence = app._last_response_sequence
+    app._run_started_at = None
+    app._last_response_sequence = None
+    if started_at is not None:
+        log = _chat_log_or_none(app)
+        if log is not None:
+            completion = Text(
+                f"Completed in {format_duration(monotonic() - started_at)}",
+                style="#7f8c98",
+            )
+            if response_sequence is None:
+                log.write(completion)
+            else:
+                log.write_before(response_sequence, completion)
 
     response = data.get("response")
     if not app._response_delivered and isinstance(response, str) and response.strip():
@@ -212,6 +281,8 @@ def handle_context_complete(app: AgentZeroCLI, data: dict[str, Any]) -> None:
     if app._compaction_refresh_context == context_id:
         app._compaction_refresh_context = None
         asyncio.create_task(_compaction_context_reload(app, context_id))
+    if was_active:
+        _notify_terminal_completion(app)
 
 
 def handle_connector_error(app: AgentZeroCLI, data: dict[str, Any]) -> None:

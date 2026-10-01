@@ -22,6 +22,7 @@ MACOS_BACKEND_FEATURES = (
     "keyboard-targets-frontmost-app",
     "accessibility-tree-snapshot",
     "accessibility-structural-targeting",
+    "app-scoped-semantic-targeting",
     "accessibility-element-click",
     "native-window-list",
     "window-state",
@@ -35,6 +36,7 @@ MACOS_BACKEND_FEATURES = (
     "frontmost-app-restore-after-click",
     "accessibility-trust",
     "session-reuse-metadata",
+    "a0-tag",
 )
 MACOS_TRUST_MODES = ("interactive", "persistent", "allow")
 STATE_DIR_ENV = "A0_COMPUTER_USE_MACOS_STATE_DIR"

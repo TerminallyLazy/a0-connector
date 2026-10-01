@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shlex
 import sys
@@ -41,6 +42,12 @@ class FakeShellSession:
 
         if command == "osc":
             self._full_output = "\x1b]8;;https://example.test\x07link\x1b]8;;\x07\r\n"
+            self._partial_output = self._full_output
+            self.command_completed = True
+            return
+
+        if command == "large":
+            self._full_output = "prefix\n" + "x" * (remote_exec.EXEC_OUTPUT_MAX_BYTES + 4096)
             self._partial_output = self._full_output
             self.command_completed = True
             return
@@ -112,6 +119,34 @@ def _manager(tmp_path: Path, *, enabled: bool = True) -> RemoteExecManager:
     return RemoteExecManager(cwd=str(tmp_path), enabled=enabled, poll_interval=0.01)
 
 
+@pytest.mark.parametrize(
+    "size",
+    [
+        0,
+        1,
+        remote_exec.EXEC_OUTPUT_MAX_BYTES - 1,
+        remote_exec.EXEC_OUTPUT_MAX_BYTES,
+        remote_exec.EXEC_OUTPUT_MAX_BYTES + 1,
+    ],
+)
+def test_exec_output_boundary_matrix(tmp_path: Path, size: int) -> None:
+    manager = _manager(tmp_path)
+    output = "x" * size
+
+    result = manager._bound_exec_output({"output": output}, session=7)
+
+    if size <= remote_exec.EXEC_OUTPUT_MAX_BYTES:
+        assert result == {"output": output}
+        assert list(tmp_path.glob("a0-exec-output-*.log")) == []
+    else:
+        output_file = Path(result["output_file"])
+        assert result["output_truncated"] is True
+        assert len(result["output"].encode("utf-8")) <= remote_exec.EXEC_OUTPUT_MAX_BYTES
+        assert result["output_total_bytes"] == size
+        assert result["output_sha256"] == hashlib.sha256(output.encode()).hexdigest()
+        assert output_file.read_text(encoding="utf-8") == output
+
+
 def test_default_timeout_config_matches_core_code_execution(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
 
@@ -170,6 +205,40 @@ async def test_remote_exec_strips_osc_terminal_sequences(
     assert result["ok"] is True
     assert result["result"]["output"] == "link"
     assert created_shells[0].commands == ["osc"]
+
+    await manager.close()
+
+
+async def test_remote_exec_spills_oversized_output_and_returns_bounded_tail(
+    tmp_path: Path,
+    created_shells: list[FakeShellSession],
+) -> None:
+    manager = _manager(tmp_path)
+
+    result = await manager.handle_exec_op(
+        {
+            "op_id": "exec-large",
+            "runtime": "terminal",
+            "session": 7,
+            "code": "large",
+        }
+    )
+
+    assert result["ok"] is True
+    output = result["result"]["output"]
+    output_path = Path(result["result"]["output_file"])
+    full_output = created_shells[0]._full_output
+    assert len(output.encode("utf-8")) <= remote_exec.EXEC_OUTPUT_MAX_BYTES
+    assert output.startswith("[Output truncated to the final bytes. Full output: ")
+    assert output.endswith("x" * 1024)
+    assert result["result"]["output_truncated"] is True
+    assert result["result"]["output_total_bytes"] == len(full_output.encode("utf-8"))
+    assert result["result"]["output_sha256"] == hashlib.sha256(
+        full_output.encode("utf-8")
+    ).hexdigest()
+    assert output_path.parent == tmp_path
+    assert output_path.read_text(encoding="utf-8") == full_output
+    assert list(tmp_path.glob(".*.partial-*")) == []
 
     await manager.close()
 
@@ -264,7 +333,7 @@ async def test_terminal_python_and_nodejs_runtimes_are_supported(
     await manager.close()
 
 
-async def test_input_runtime_sends_keystrokes_into_running_session(
+async def test_terminal_input_sends_keystrokes_into_running_session(
     tmp_path: Path,
     created_shells: list[FakeShellSession],
 ) -> None:
@@ -299,9 +368,10 @@ async def test_input_runtime_sends_keystrokes_into_running_session(
     input_result = await manager.handle_exec_op(
         {
             "op_id": "exec-input",
-            "runtime": "input",
+            "runtime": "terminal",
+            "allow_running": True,
             "session": 0,
-            "keyboard": "y",
+            "code": "y",
         }
     )
 
@@ -315,6 +385,45 @@ async def test_input_runtime_sends_keystrokes_into_running_session(
     assert created_shells[0].inputs == ["y"]
 
     await manager.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uses POSIX shell quoting")
+@pytest.mark.parametrize("reply", ["hello", ""])
+async def test_terminal_input_reaches_real_process_without_shell_bookkeeping(tmp_path: Path, reply: str) -> None:
+    manager = _manager(tmp_path)
+    manager.set_exec_config({
+        "version": 1,
+        "code_exec_timeouts": {
+            "first_output_timeout": 1, "between_output_timeout": 1,
+            "max_exec_timeout": 5, "dialog_timeout": 0,
+        },
+        "dialog_patterns": [r"\?\s*$"],
+    })
+    workdir = tmp_path / "child"
+    workdir.mkdir()
+    code = 'print("REPLY=" + repr(input("Continue? ")), flush=True)'
+    command = f"cd child\n{shlex.quote(sys.executable)} -u -c {shlex.quote(code)} # trailing comment"
+    try:
+        started = await manager.handle_exec_op({"runtime": "terminal", "code": command})
+        assert started["ok"] and started["result"]["running"]
+        assert started["result"]["output"] == "Continue?"
+        answered = await manager.handle_exec_op({"runtime": "terminal", "code": reply, "allow_running": True})
+        assert answered["ok"] and not answered["result"]["running"]
+        assert answered["result"]["output"] == f"REPLY={reply!r}"
+        next_command = await manager.handle_exec_op({"runtime": "terminal", "code": "pwd"})
+        assert next_command["ok"] and next_command["result"]["output"] == str(workdir)
+        idle_input = await manager.handle_exec_op({"runtime": "terminal", "code": "printf idle", "allow_running": True})
+        assert idle_input["ok"] and idle_input["result"]["output"] == "idle"
+    finally:
+        await manager.close()
+
+
+async def test_removed_input_runtime_has_no_alias(tmp_path: Path, created_shells: list[FakeShellSession]) -> None:
+    manager = _manager(tmp_path)
+    result = await manager.handle_exec_op({"runtime": "input", "keyboard": "yes"})
+    assert not result["ok"]
+    assert "runtime must be one of" in result["error"]
+    assert created_shells == []
 
 
 async def test_terminal_runtime_reset_true_closes_running_session_and_runs_replacement(
@@ -387,9 +496,11 @@ async def test_shell_close_terminates_child_process_that_keeps_stdout_open(
     await asyncio.wait_for(shell.close(), timeout=5)
 
 
+@pytest.mark.parametrize("allow_running", [False, True])
 async def test_mutating_exec_runtimes_are_blocked_when_local_access_is_read_only(
     tmp_path: Path,
     created_shells: list[FakeShellSession],
+    allow_running: bool,
 ) -> None:
     manager = RemoteExecManager(
         cwd=str(tmp_path),
@@ -402,6 +513,7 @@ async def test_mutating_exec_runtimes_are_blocked_when_local_access_is_read_only
         {
             "op_id": "exec-read-only",
             "runtime": "terminal",
+            "allow_running": allow_running,
             "session": 0,
             "code": "ansi",
         }

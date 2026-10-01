@@ -98,7 +98,7 @@ def _manager(
             computer_use_trust_mode=trust_mode,
             computer_use_restore_token=restore_token,
         ),
-        backend_selection=backend_selection,
+        backend_selection=backend_selection or _selection(),
     )
     if supported is not None:
         manager.supported = supported
@@ -204,6 +204,142 @@ async def test_status_is_allowed_while_disabled_but_other_actions_are_rejected(
     assert status["result"]["status"] == "disabled"
     assert rejected["ok"] is False
     assert rejected["code"] == "COMPUTER_USE_DISABLED"
+
+
+async def test_launcher_tag_uses_private_backend_actions_without_remote_advertising(
+    _temp_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(
+        enabled=True,
+        backend_selection=_selection(features=("inline-png-capture", "a0-tag")),
+    )
+
+    async def fake_start(op_id: str, session: _HelperSession) -> dict[str, object]:
+        session.active = True
+        session.session_id = "tag-session"
+        return {"op_id": op_id, "ok": True, "result": {"session_id": session.session_id}}
+
+    dispatched: list[dict[str, object]] = []
+
+    async def fake_dispatch(
+        op_id: str,
+        session: _HelperSession,
+        request: dict[str, object],
+    ) -> dict[str, object]:
+        assert session.session_id == "tag-session"
+        dispatched.append(dict(request))
+        return {"op_id": op_id, "ok": True, "result": {"action": request["action"]}}
+
+    monkeypatch.setattr(manager, "_start_session", fake_start)
+    monkeypatch.setattr(manager, "_dispatch_session_action", fake_dispatch)
+
+    assert manager.launcher_tag_supported is True
+    assert "tag_context" not in computer_use_mod._SUPPORTED_ACTIONS
+    assert (await manager.tag_context())["ok"] is True
+    assert (await manager.tag_replace("target-1", "reply"))["ok"] is True
+    assert (await manager.tag_release("target-1"))["ok"] is True
+    assert manager._sessions["launcher-tag"].active is False
+    assert dispatched == [
+        {"action": "tag_context", "context_id": "launcher-tag"},
+        {
+            "action": "tag_replace",
+            "context_id": "launcher-tag",
+            "target_token": "target-1",
+            "replacement": "reply",
+        },
+        {
+            "action": "tag_release",
+            "context_id": "launcher-tag",
+            "target_token": "target-1",
+        },
+    ]
+
+
+async def test_launcher_tag_rejects_unadvertised_backend(_temp_env: Path) -> None:
+    manager = _manager(enabled=True, backend_selection=_selection())
+
+    result = await manager.tag_context()
+
+    assert result["ok"] is False
+    assert result["code"] == "COMPUTER_USE_UNSUPPORTED"
+
+
+async def test_launcher_tag_capture_failure_closes_its_private_session(
+    _temp_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(
+        enabled=True,
+        backend_selection=_selection(features=("inline-png-capture", "a0-tag")),
+    )
+    session = manager._sessions.setdefault("launcher-tag", _HelperSession(context_id="launcher-tag"))
+    session.active = True
+    session.session_id = "tag-session"
+
+    async def failed_action(_action: str, **_payload: object) -> dict[str, object]:
+        return {"ok": False, "code": "A0_TAG_NOT_FOUND", "error": "No tag found."}
+
+    stopped: list[str] = []
+
+    async def stop_session(_op_id: str, current: _HelperSession) -> dict[str, object]:
+        stopped.append(current.context_id)
+        current.active = False
+        current.session_id = ""
+        return {"ok": True, "result": {"status": "stopped"}}
+
+    monkeypatch.setattr(manager, "_tag_action", failed_action)
+    monkeypatch.setattr(manager, "_stop_session", stop_session)
+
+    result = await manager.tag_context()
+
+    assert result["code"] == "A0_TAG_NOT_FOUND"
+    assert stopped == ["launcher-tag"]
+    assert session.active is False
+
+
+async def test_macos_launcher_tag_start_does_not_require_screen_recording_setup(
+    _temp_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(
+        enabled=True,
+        trust_mode="persistent",
+        restore_token="123e4567-e89b-12d3-a456-426614174000",
+        backend_selection=_selection(
+            backend_id="macos",
+            backend_family="macos",
+            features=("inline-png-capture", "a0-tag"),
+        ),
+    )
+    prepare = AsyncMock(side_effect=AssertionError("tag startup must not require Screen Recording"))
+
+    async def helper_request(
+        _session: _HelperSession,
+        request: dict[str, object],
+    ) -> dict[str, object]:
+        assert request["action"] == "start_session"
+        assert request["context_id"] == "launcher-tag"
+        return {
+            "ok": True,
+            "result": {
+                "context_id": "launcher-tag",
+                "session_id": "tag-session",
+                "status": "active",
+                "active": True,
+            },
+        }
+
+    monkeypatch.setattr(manager, "_prepare_macos_permissions", prepare)
+    monkeypatch.setattr(manager, "_helper_request", helper_request)
+
+    session = _HelperSession(context_id="launcher-tag")
+    result = await manager._start_session("tag-start", session)
+
+    assert result["ok"] is True
+    assert session.active is True
+    assert session.session_id == "tag-session"
+    prepare.assert_not_awaited()
 
 
 async def test_allow_without_restore_token_returns_rearm_required(
@@ -958,6 +1094,41 @@ async def test_capture_embeds_legacy_path_result_without_advertising_path(
     assert "host_path" not in result["result"]
     assert "capture_path" not in result["result"]
     assert "container_path" not in result["result"]
+
+
+async def test_capture_rejects_oversized_file_before_reading(
+    _temp_env: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(enabled=True)
+    capture_path = tmp_path / "oversized.png"
+    capture_path.write_bytes(b"12345")
+    monkeypatch.setattr(computer_use_mod, "_CAPTURE_ARTIFACT_MAX_BYTES", 4)
+    monkeypatch.setattr(Path, "read_bytes", lambda _path: pytest.fail("oversized source was read"))
+    manager._helper_request = AsyncMock(
+        return_value={
+            "ok": True,
+            "result": {
+                "host_path": str(capture_path),
+                "width": 640,
+                "height": 480,
+                "session_id": "sess-1",
+            },
+        }
+    )
+    session = _HelperSession(context_id="ctx-1", session_id="sess-1", active=True)
+    session.process = type("FakeProcess", (), {"returncode": None})()
+    manager._sessions["ctx-1"] = session
+
+    result = await manager.handle_op(
+        {"op_id": "cap-large", "action": "capture", "context_id": "ctx-1", "session_id": "sess-1"}
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "BAD_REQUEST"
+    assert "too large" in result["error"]
+    assert capture_path.exists()
 
 
 async def test_capture_includes_base64_artifact_from_written_capture_path(

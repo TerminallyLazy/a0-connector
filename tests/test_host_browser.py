@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import os
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 import agent_zero_cli.host_browser_common as host_browser_common
 import agent_zero_cli.host_browser_manager as host_browser_manager_module
+import agent_zero_cli.host_browser_safari as host_browser_safari
+import agent_zero_cli.host_browser_session as host_browser_session_module
 from agent_zero_cli.config import CLIConfig
 from agent_zero_cli.host_browser import (
     BrowserCandidate,
@@ -16,6 +23,7 @@ from agent_zero_cli.host_browser import (
     HostBrowserSession,
     ProfileLockState,
     RELAUNCH_CONTEXT_ID,
+    SafariContext,
     a0_managed_user_data_dir,
     chromium_launch_args,
     content_helper_sha256,
@@ -33,6 +41,42 @@ from agent_zero_cli.host_browser import (
 
 
 pytestmark = pytest.mark.anyio
+
+
+@pytest.mark.parametrize("args", [{"expression": "document.title"}, {}, {"script": " "}, {"script": 42}])
+async def test_evaluate_rejects_missing_or_invalid_script(monkeypatch, args):
+    session = HostBrowserSession(context_id="ctx-evaluate", profile=None)
+    started = AsyncMock()
+    monkeypatch.setattr(session, "ensure_started", started)
+    with pytest.raises(ValueError, match="non-empty 'script'"):
+        await session.dispatch({"action": "evaluate", **args})
+    result = await session.dispatch({"action": "multi", "calls": [{"action": "evaluate", **args}]})
+    assert result == [{"ok": False, "error": "evaluate requires a non-empty 'script' string"}]
+    started.assert_not_awaited()
+
+
+@pytest.mark.parametrize("value", [None, False, 0, {"answer": 42}])
+async def test_evaluate_preserves_javascript_results(monkeypatch, value):
+    session = HostBrowserSession(context_id="ctx-evaluate", profile=None)
+    cdp = SimpleNamespace(send=AsyncMock(), detach=AsyncMock())
+    page = SimpleNamespace(
+        evaluate=AsyncMock(return_value=value), is_closed=lambda: False,
+        context=SimpleNamespace(new_cdp_session=AsyncMock(return_value=cdp)),
+    )
+    session.pages[3] = host_browser_session_module.HostBrowserPage(3, page)
+    monkeypatch.setattr(session, "ensure_started", AsyncMock())
+    monkeypatch.setattr(session, "_resolve_browser_id", lambda _: 3)
+    monkeypatch.setattr(session, "_page", lambda _: page)
+    monkeypatch.setattr(session, "_state", AsyncMock(return_value={"id": 3}))
+    script = "() => globalThis.probeValue"
+    result = await session.evaluate(3, script)
+    assert result == {"result": value, "state": {"id": 3}}
+    page.evaluate.assert_awaited_once_with(script)
+
+
+@pytest.fixture(autouse=True)
+def _linux_host_browser_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(host_browser_common.platform, "system", lambda: "Linux")
 
 MINIMAL_CONTENT_HELPER_SOURCE = """
 (() => {
@@ -223,7 +267,7 @@ class FakeStarter:
 
 
 def test_discover_profiles_reads_local_state_names(tmp_path: Path) -> None:
-    root = tmp_path / "Chrome"
+    root = tmp_path / "ChromeData"
     (root / "Default").mkdir(parents=True)
     (root / "Profile 1").mkdir()
     (root / "Local State").write_text(
@@ -263,6 +307,252 @@ def test_a0_managed_user_data_dir_is_separate_from_default_chrome_dir(
 
     assert path == tmp_path / "data" / "a0/browser-profiles/chrome"
     assert path != tmp_path / "config" / "google-chrome"
+
+
+def test_safari_profile_is_selectable_without_playwright(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "Safari"
+    driver = tmp_path / "safaridriver"
+    executable.touch()
+    driver.touch()
+    monkeypatch.setattr(host_browser_manager_module.sys, "platform", "darwin")
+    monkeypatch.setattr(host_browser_manager_module, "SAFARI_DRIVER_PATH", driver)
+    manager = HostBrowserManager(
+        CLIConfig(host_browser_enabled=True),
+        candidate_provider=lambda: [
+            BrowserCandidate("safari", "Safari", str(executable), Path())
+        ],
+        playwright_available=False,
+    )
+
+    metadata = manager.hello_metadata(
+        profile_mode="existing",
+        browser_selection="safari",
+    )
+
+    assert metadata["supported"] is True
+    assert metadata["can_repair"] is False
+    assert metadata["browser_id"] == "safari:default"
+    assert metadata["browser_label"] == "Safari - Automation window"
+    assert metadata["profile_path"] == str(executable)
+    assert "safari_webdriver" in metadata["features"]
+
+
+class FakeSafariProtocol:
+    def __init__(self) -> None:
+        self.current_handle = ""
+        self.calls: list[tuple[str, str, dict | None]] = []
+        self.url = "about:blank"
+
+    async def session_request(
+        self,
+        method: str,
+        path: str = "",
+        payload: dict | None = None,
+    ) -> object:
+        self.calls.append((method, path, payload))
+        if (method, path) == ("GET", "window/handles"):
+            return ["tab-1"]
+        if (method, path) == ("POST", "window"):
+            self.current_handle = str((payload or {}).get("handle") or "")
+            return None
+        if (method, path) == ("POST", "url"):
+            self.url = str((payload or {}).get("url") or "")
+            return None
+        if (method, path) == ("GET", "url"):
+            return self.url
+        if (method, path) == ("GET", "title"):
+            return "Safari example"
+        if (method, path) == ("POST", "execute/sync"):
+            args = (payload or {}).get("args") or []
+            return args[0] if args else "complete"
+        if (method, path) == ("GET", "screenshot"):
+            return base64.b64encode(
+                base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                )
+            ).decode("ascii")
+        return None
+
+
+async def test_safari_page_maps_existing_browser_operations_to_webdriver() -> None:
+    driver = FakeSafariProtocol()
+    context = SafariContext(driver)  # type: ignore[arg-type]
+    await context.discover_pages(notify=False)
+    page = await context.new_page()
+
+    await page.goto("https://example.com/")
+    evaluated = await page.evaluate("(value) => value", {"answer": 42})
+    await page.evaluate(MINIMAL_CONTENT_HELPER_SOURCE)
+    await page.mouse.click(10, 20)
+    await page.keyboard.press("Meta+Enter")
+    screenshot = await page.screenshot(type="jpeg", quality=75)
+
+    assert evaluated == {"answer": 42}
+    assert screenshot.startswith(b"\xff\xd8")
+    execute = [call for call in driver.calls if call[:2] == ("POST", "execute/sync")]
+    assert execute[0][2] == {
+        "script": "return ((value) => value)(arguments[0]);",
+        "args": [{"answer": 42}],
+    }
+    assert execute[1][2] == {"script": MINIMAL_CONTENT_HELPER_SOURCE.strip(), "args": []}
+    actions = [call for call in driver.calls if call[:2] == ("POST", "actions")]
+    assert any(call[2]["actions"][0]["type"] == "pointer" for call in actions)
+    assert any(call[2]["actions"][0]["type"] == "key" for call in actions)
+    with pytest.raises(RuntimeError, match="viewport screenshots"):
+        await page.screenshot(full_page=True)
+
+
+async def test_safari_session_restarts_after_driver_or_session_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_zero_cli.host_browser_session as host_browser_session_module
+
+    instances = []
+
+    class FakeProcess:
+        returncode: int | None = None
+
+    class FakeSafariDriver:
+        def __init__(self) -> None:
+            self.process = FakeProcess()
+            self.context = FakeContext()
+            self.closed = False
+            self.session_active = True
+            instances.append(self)
+
+        async def start(self) -> FakeContext:
+            return self.context
+
+        async def session_request(self, *_: object) -> list[str]:
+            if not self.session_active:
+                raise host_browser_safari.SafariDriverError("invalid session id")
+            return []
+
+        async def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(host_browser_session_module, "SafariDriver", FakeSafariDriver)
+    session = HostBrowserSession(
+        context_id="ctx-safari-recovery",
+        profile=BrowserProfile(
+            "safari",
+            "Safari",
+            "/Applications/Safari.app",
+            Path(),
+            "Default",
+            "Automation window",
+        ),
+    )
+
+    await session.ensure_started()
+    instances[0].process.returncode = -15
+    await session.ensure_started()
+    instances[1].session_active = False
+    await session.ensure_started()
+
+    assert len(instances) == 3
+    assert all(instance.closed for instance in instances[:2])
+    assert session.browser is instances[2]
+    assert session.context is instances[2].context
+    await session.close()
+
+
+async def test_safari_manager_releases_stale_session_for_new_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_zero_cli.host_browser_session as host_browser_session_module
+
+    instances = []
+
+    class FakeProcess:
+        returncode: int | None = None
+
+    class FakeSafariContext(FakeContext):
+        async def discover_pages(self) -> list[FakePage]:
+            return []
+
+    class FakeSafariDriver:
+        def __init__(self) -> None:
+            self.process = FakeProcess()
+            self.context = FakeSafariContext()
+            self.closed = False
+            self.session_active = True
+            instances.append(self)
+
+        async def start(self) -> FakeSafariContext:
+            return self.context
+
+        async def session_request(self, *_: object) -> list[str]:
+            if not self.session_active:
+                raise host_browser_safari.SafariDriverError("invalid session id")
+            return []
+
+        async def close(self) -> None:
+            self.closed = True
+
+    executable = tmp_path / "Safari"
+    driver = tmp_path / "safaridriver"
+    executable.touch()
+    driver.touch()
+    monkeypatch.setattr(host_browser_manager_module.sys, "platform", "darwin")
+    monkeypatch.setattr(host_browser_manager_module, "SAFARI_DRIVER_PATH", driver)
+    monkeypatch.setattr(host_browser_session_module, "SafariDriver", FakeSafariDriver)
+    manager = HostBrowserManager(
+        CLIConfig(host_browser_enabled=True),
+        candidate_provider=lambda: [
+            BrowserCandidate("safari", "Safari", str(executable), Path())
+        ],
+        playwright_available=False,
+    )
+
+    first = await manager.handle_op(
+        {
+            "op_id": "op-safari-first",
+            "context_id": "ctx-safari-first",
+            "action": "list",
+            "browser_selection": "safari",
+        }
+    )
+    instances[0].session_active = False
+    second = await manager.handle_op(
+        {
+            "op_id": "op-safari-second",
+            "context_id": "ctx-safari-second",
+            "action": "list",
+            "browser_selection": "safari",
+        }
+    )
+    third = await manager.handle_op(
+        {
+            "op_id": "op-safari-third",
+            "context_id": "ctx-safari-third",
+            "action": "list",
+            "browser_selection": "safari",
+        }
+    )
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert third["code"] == "HOST_BROWSER_CONTEXT_ACTIVE"
+    assert instances[0].closed is True
+    assert len(instances) == 2
+    assert set(manager._sessions) == {"ctx-safari-second"}
+    await manager.close()
+
+
+def test_safari_permission_error_names_the_current_settings_path() -> None:
+    message = host_browser_safari._friendly_driver_error(
+        "Remote automation is not enabled."
+    )
+
+    assert "Safari > Settings > Advanced" in message
+    assert "Show features for web developers" in message
+    assert "Developer" in message
+    assert "Allow remote automation" in message
 
 
 def test_linux_candidate_detection_includes_major_chromium_browsers(
@@ -399,6 +689,7 @@ def test_remote_debugging_profile_is_discovered_when_chrome_allows_it(
     )
     assert len(profiles) == 1
     assert profiles[0].family == "chrome-cdp"
+    assert profiles[0].browser_id == "chrome-cdp"
     assert profiles[0].profile_label == "localhost:9222"
     assert profiles[0].cdp_endpoint == "ws://localhost:9222/devtools/browser/test"
     assert profiles[0].as_dict()["locked"] is False
@@ -626,11 +917,34 @@ def test_hello_metadata_advertises_host_browser_inventory(tmp_path: Path) -> Non
     metadata = manager.hello_metadata()
     advertised = {item["id"]: item for item in metadata["available_browsers"]}
 
-    assert metadata["browser_id"] == "ws://localhost:9222/devtools/browser/test"
+    assert metadata["browser_id"] == "chrome-cdp"
     assert metadata["browser_label"] == "Google Chrome (remote debugging) - Remote debugging allowed"
-    assert "ws://localhost:9222/devtools/browser/test" in advertised
+    assert advertised["chrome-cdp"]["cdp_endpoint"] == "ws://localhost:9222/devtools/browser/test"
     assert advertised["chrome:default"]["family"] == "chrome"
     assert advertised["chrome:profile_1"]["label"] == "Google Chrome - Profile 1"
+
+
+def test_discovered_remote_debugging_id_resolves_latest_endpoint(tmp_path: Path) -> None:
+    root = tmp_path / "google-chrome"
+    root.mkdir()
+    active_port = root / "DevToolsActivePort"
+    active_port.write_text("9222\n/devtools/browser/old\n", encoding="utf-8")
+    manager = HostBrowserManager(
+        CLIConfig(host_browser_enabled=True),
+        candidate_provider=lambda: [BrowserCandidate("chrome", "Google Chrome", "/bin/chrome", root)],
+        playwright_available=False,
+    )
+
+    selection = manager.hello_metadata()["browser_id"]
+    active_port.write_text("9333\n/devtools/browser/new\n", encoding="utf-8")
+    selected = manager.selected_profile(
+        profile_mode="existing",
+        browser_selection=selection,
+    )
+
+    assert selection == "chrome-cdp"
+    assert selected is not None
+    assert selected.cdp_endpoint == "ws://localhost:9333/devtools/browser/new"
 
 
 def test_browser_selection_accepts_family_id(tmp_path: Path) -> None:
@@ -691,8 +1005,45 @@ def test_browser_selection_accepts_explicit_cdp_endpoint() -> None:
 
     assert selected is not None
     assert selected.family == "chrome-cdp"
+    assert selected.browser_id == "ws://127.0.0.1:9333/devtools/browser/test"
     assert selected.cdp_endpoint == "ws://127.0.0.1:9333/devtools/browser/test"
     assert manager.status_snapshot(profile=selected)["supported"] is True
+
+
+async def test_browser_prepare_waits_for_remote_debugging_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "google-chrome"
+    (root / "Default").mkdir(parents=True)
+    active_port = root / "DevToolsActivePort"
+    waits = []
+
+    async def fake_sleep(delay: float) -> None:
+        waits.append(delay)
+        active_port.write_text("9222\n/devtools/browser/ready\n", encoding="utf-8")
+
+    async def fake_ensure_started(session: HostBrowserSession) -> None:
+        session.context = object()
+
+    monkeypatch.setattr(host_browser_manager_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        host_browser_manager_module,
+        "remote_debugging_restriction_reason",
+        lambda profile: "waiting for remote debugging" if not profile.is_remote_debugging else "",
+    )
+    monkeypatch.setattr(HostBrowserSession, "ensure_started", fake_ensure_started)
+    manager = HostBrowserManager(
+        CLIConfig(host_browser_enabled=True),
+        candidate_provider=lambda: [BrowserCandidate("chrome", "Google Chrome", "/bin/chrome", root)],
+        playwright_available=False,
+    )
+
+    result = await manager.ensure_available(profile_mode="existing")
+
+    assert waits == [0.25]
+    assert result["browser_id"] == "chrome-cdp"
+    assert result["cdp_endpoint"] == "ws://localhost:9222/devtools/browser/ready"
 
 
 def test_browser_selection_accepts_cdp_discovery_address() -> None:
@@ -806,6 +1157,28 @@ def test_chromium_launch_args_use_wayland_only_without_x_display(
     assert "--ozone-platform=wayland" in args
 
 
+def test_windows_browser_version_uses_file_metadata_without_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_browser_common.browser_major_version.cache_clear()
+    monkeypatch.setattr(host_browser_common.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(
+        host_browser_common.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("Windows browser version lookup launched the browser"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "win32api",
+        SimpleNamespace(GetFileVersionInfo=lambda _path, _query: {"FileVersionMS": 152 << 16}),
+    )
+
+    try:
+        assert host_browser_common.browser_major_version("C:/Program Files/Browser/browser.exe") == 152
+    finally:
+        host_browser_common.browser_major_version.cache_clear()
+
+
 def test_remote_debugging_restriction_blocks_default_chrome_profile(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -898,7 +1271,7 @@ def test_agent_profile_mode_selects_supported_a0_profile_when_default_is_restric
 
 
 def test_hello_metadata_marks_missing_playwright_as_preparable(tmp_path: Path) -> None:
-    root = tmp_path / "Chrome"
+    root = tmp_path / "ChromeData"
     (root / "Default").mkdir(parents=True)
     executable = tmp_path / "chrome"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -962,7 +1335,7 @@ def test_hello_metadata_marks_restricted_saved_profile_as_preparable(
 
 
 async def test_host_browser_manager_dispatches_open_and_screenshot_artifact(tmp_path: Path) -> None:
-    root = tmp_path / "Chrome"
+    root = tmp_path / "ChromeData"
     (root / "Default").mkdir(parents=True)
     executable = tmp_path / "chrome"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -999,8 +1372,47 @@ async def test_host_browser_manager_dispatches_open_and_screenshot_artifact(tmp_
     assert playwright.chromium.launch_kwargs["user_data_dir"] == str(root)
 
 
-async def test_host_browser_manager_uses_agent_zero_supplied_content_helper(tmp_path: Path) -> None:
+async def test_host_browser_rejects_oversized_screenshot_before_base64(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = tmp_path / "Chrome"
+    (root / "Default").mkdir(parents=True)
+    executable = tmp_path / "chrome"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    playwright = FakePlaywright()
+    monkeypatch.setattr(host_browser_session_module, "_SCREENSHOT_ARTIFACT_MAX_BYTES", 4)
+    monkeypatch.setattr(FakePage, "screenshot", lambda self, **kwargs: _oversized_screenshot(kwargs))
+    manager = HostBrowserManager(
+        CLIConfig(
+            host_browser_enabled=True,
+            host_browser_family="chrome",
+            host_browser_profile_path=str(root),
+            host_browser_profile_label="Default",
+        ),
+        candidate_provider=lambda: [BrowserCandidate("chrome", "Google Chrome", str(executable), root)],
+        playwright_available=True,
+        playwright_starter=lambda: FakeStarter(playwright),
+    )
+
+    await manager.handle_op(
+        {"op_id": "op-open", "context_id": "ctx-1", "action": "open", "url": "https://example.com/"}
+    )
+    result = await manager.handle_op(
+        {"op_id": "op-shot", "context_id": "ctx-1", "action": "screenshot", "browser_id": 1}
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "HOST_BROWSER_ERROR"
+    assert "too large" in result["error"]
+
+
+async def _oversized_screenshot(_kwargs: dict[str, object]) -> bytes:
+    return b"12345"
+
+
+async def test_host_browser_manager_uses_agent_zero_supplied_content_helper(tmp_path: Path) -> None:
+    root = tmp_path / "ChromeData"
     (root / "Default").mkdir(parents=True)
     executable = tmp_path / "chrome"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -1054,7 +1466,7 @@ async def test_relaunch_session_is_adopted_by_first_browser_context(
 ) -> None:
     import agent_zero_cli.host_browser_common as host_browser_common_module
 
-    root = tmp_path / "Chrome"
+    root = tmp_path / "ChromeData"
     (root / "Default").mkdir(parents=True)
     executable = tmp_path / "chrome"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -1182,7 +1594,7 @@ async def test_remote_debugging_connection_failure_reports_enable_hint(
             instances.append(self)
 
         async def connect(self) -> None:
-            raise OSError("connect failed")
+            raise TimeoutError
 
         async def close(self) -> None:
             self.closed = True
@@ -1205,8 +1617,70 @@ async def test_remote_debugging_connection_failure_reports_enable_hint(
     message = str(excinfo.value)
     assert "chrome://inspect/#remote-debugging" in message
     assert "Allow remote debugging for this browser instance" in message
-    assert "connect failed" in message
+    assert "TimeoutError" in message
     assert instances[0].closed is True
+
+
+async def test_remote_debugging_connection_retries_changed_active_port(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent_zero_cli.host_browser_session as host_browser_session_module
+
+    root = tmp_path / "google-chrome"
+    root.mkdir()
+    active_port = root / "DevToolsActivePort"
+    active_port.write_text("9222\n/devtools/browser/old\n", encoding="utf-8")
+    instances = []
+
+    class RefreshingCDPConnection:
+        def __init__(self, endpoint: str) -> None:
+            self.endpoint = endpoint
+            self.closed = False
+            instances.append(self)
+
+        async def connect(self) -> None:
+            if len(instances) == 1:
+                active_port.write_text("9333\n/devtools/browser/new\n", encoding="utf-8")
+                raise OSError("endpoint changed")
+
+        async def close(self) -> None:
+            self.closed = True
+
+        async def command(
+            self,
+            method: str,
+            params: dict[str, object] | None = None,
+            *,
+            session_id: str | None = None,
+            timeout: float = 30.0,
+        ) -> dict[str, object]:
+            del params, session_id, timeout
+            if method == "Target.getTargets":
+                return {"targetInfos": []}
+            return {}
+
+    monkeypatch.setattr(host_browser_session_module, "CDPConnection", RefreshingCDPConnection)
+    profile = BrowserProfile(
+        "chrome-cdp",
+        "Chrome (remote debugging)",
+        "",
+        root,
+        "localhost:9222",
+        "Remote debugging allowed",
+        cdp_endpoint="ws://localhost:9222/devtools/browser/old",
+    )
+    session = HostBrowserSession(context_id="ctx-cdp-refresh", profile=profile)
+
+    await session.ensure_started()
+    await session.close()
+
+    assert [instance.endpoint for instance in instances] == [
+        "ws://localhost:9222/devtools/browser/old",
+        "ws://localhost:9333/devtools/browser/new",
+    ]
+    assert instances[0].closed is True
+    assert session.profile.cdp_endpoint == "ws://localhost:9333/devtools/browser/new"
 
 
 async def test_remote_debugging_session_opens_lists_and_reads_content(
@@ -1265,7 +1739,7 @@ async def test_remote_debugging_session_opens_lists_and_reads_content(
                 target_id = str(params.get("targetId") or "")
                 self.closed_targets.append(target_id)
                 self.targets.pop(target_id, None)
-                return {}
+                return {"success": True}
             if method in {"Page.enable", "Runtime.enable", "Page.addScriptToEvaluateOnNewDocument"}:
                 return {}
             if method == "Page.navigate":
@@ -1327,7 +1801,7 @@ async def test_remote_debugging_session_opens_lists_and_reads_content(
 async def test_remote_ensure_respects_disabled_state_while_local_preparation_can_enable(
     tmp_path: Path,
 ) -> None:
-    root = tmp_path / "Chrome"
+    root = tmp_path / "ChromeData"
     (root / "Default").mkdir(parents=True)
     executable = tmp_path / "chrome"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -1462,7 +1936,7 @@ async def test_locked_profile_owned_by_active_context_reports_context_conflict(
 ) -> None:
     import agent_zero_cli.host_browser_common as host_browser_common_module
 
-    root = tmp_path / "Chrome"
+    root = tmp_path / "ChromeData"
     (root / "Default").mkdir(parents=True)
     executable = tmp_path / "chrome"
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -1531,6 +2005,109 @@ async def test_host_browser_session_stops_playwright_after_launch_failure(tmp_pa
     assert playwright.stopped is True
     assert session.playwright is None
     assert session.context is None
+
+
+@pytest.mark.parametrize(
+    ("family", "expected_url"),
+    [
+        ("chrome", "chrome://inspect/#remote-debugging"),
+        ("opera", "opera://inspect/#remote-debugging"),
+        ("edge", "edge://inspect/#remote-debugging"),
+    ],
+)
+async def test_host_browser_opens_allowlisted_remote_debugging_page_while_disabled(
+    family: str,
+    expected_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    launched: list[list[str]] = []
+    monkeypatch.setattr(host_browser_manager_module.platform, "system", lambda: "Linux")
+    candidates = [
+        BrowserCandidate(name, name.title(), str(tmp_path / name), tmp_path / name)
+        for name in ("chrome", "opera", "edge")
+    ]
+    monkeypatch.setattr(
+        host_browser_manager_module.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launched.append(command),
+    )
+    manager = HostBrowserManager(
+        CLIConfig(host_browser_enabled=False),
+        candidate_provider=lambda: candidates,
+        playwright_available=True,
+    )
+
+    result = await manager.handle_op(
+        {
+            "op_id": f"open-{family}-setup",
+            "action": "open_remote_debugging",
+            "browser_family": family,
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["result"]["url"] == expected_url
+    assert launched == [[str(tmp_path / family), expected_url]]
+
+
+async def test_host_browser_uses_macos_open_for_internal_setup_urls(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    launched: list[list[str]] = []
+    monkeypatch.setattr(host_browser_manager_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        host_browser_manager_module.subprocess,
+        "Popen",
+        lambda command, **_kwargs: launched.append(command),
+    )
+    manager = HostBrowserManager(
+        CLIConfig(host_browser_enabled=False),
+        candidate_provider=lambda: [
+            BrowserCandidate("chrome", "Google Chrome", str(tmp_path / "chrome"), tmp_path)
+        ],
+        playwright_available=True,
+    )
+
+    result = await manager.handle_op(
+        {
+            "op_id": "open-chrome-setup-macos",
+            "action": "open_remote_debugging",
+            "browser_family": "chrome",
+        }
+    )
+
+    assert result["ok"] is True
+    assert launched == [
+        [
+            "/usr/bin/open",
+            "-a",
+            "Google Chrome",
+            "chrome://inspect/#remote-debugging",
+        ]
+    ]
+
+
+async def test_host_browser_rejects_arbitrary_remote_debugging_target(tmp_path: Path) -> None:
+    manager = HostBrowserManager(
+        CLIConfig(host_browser_enabled=False),
+        candidate_provider=lambda: [
+            BrowserCandidate("chrome", "Google Chrome", str(tmp_path / "chrome"), tmp_path)
+        ],
+        playwright_available=True,
+    )
+
+    result = await manager.handle_op(
+        {
+            "op_id": "open-arbitrary-setup",
+            "action": "open_remote_debugging",
+            "browser_family": "chrome --arbitrary-flag",
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "HOST_BROWSER_SETUP_UNSUPPORTED"
 
 
 async def test_set_checked_dispatch_parses_false_string(tmp_path: Path) -> None:
@@ -1651,7 +2228,7 @@ async def test_browser_preparation_repairs_playwright_before_reporting_no_browse
     assert metadata["can_prepare"] is False
     assert metadata["can_repair"] is True
 
-    with pytest.raises(RuntimeError, match="No Chromium-family browser profile"):
+    with pytest.raises(RuntimeError, match="No supported host browser"):
         await manager.ensure_available(profile_mode="existing")
 
     assert calls == [manager.playwright_install_command()]

@@ -3,9 +3,17 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from pathlib import Path
+import sys
 
 from agent_zero_cli import __version__
 from agent_zero_cli.client import DEFAULT_HOST
+
+
+def _configure_windows_machine_stdio() -> None:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -123,6 +131,36 @@ def _build_parser() -> argparse.ArgumentParser:
         default=".",
         help="Local workspace root for remote file and exec operations.",
     )
+    headless.add_argument(
+        "--launcher-tag",
+        action="store_true",
+        help="Run one Launcher-owned A0 Tag request without exposing local host tools.",
+    )
+    headless.add_argument(
+        "--agent-profile",
+        default="",
+        metavar="KEY",
+        help="Agent profile for a new Launcher-tag chat.",
+    )
+    headless.add_argument(
+        "--attachment-ref",
+        dest="attachment_refs",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Existing Agent Zero upload reference attached to a Launcher-tag request; repeat for more.",
+    )
+    acp = subparsers.add_parser(
+        "acp",
+        help="Run an Agent Client Protocol stdio server through Agent Zero.",
+    )
+    acp.add_argument("--host", dest="acp_host", metavar="URL", help="Agent Zero base URL.")
+    acp.add_argument("--workspace", metavar="DIR", default=".", help="Fallback workspace when the ACP client does not provide one.")
+    acp.add_argument("--no-docker-discovery", action="store_true", help="Skip local Docker instance discovery.")
+    acp.add_argument("--check", action="store_true", help="Verify ACP support and exit.")
+    acp.add_argument("--debug", action="store_true", help="Write ACP diagnostics to stderr.")
+    acp.add_argument("--transport", choices=("connector", "container"), help=argparse.SUPPRESS)
+    acp.add_argument("--container-id", help=argparse.SUPPRESS)
     gateway = subparsers.add_parser(
         "gateway",
         help="Run a Launcher-supervised host-tools gateway over JSONL.",
@@ -165,9 +203,11 @@ def _run_app(
     connect_configured_host: bool = False,
 ) -> None:
     from agent_zero_cli.config import load_config
+    from agent_zero_cli.image_render import initialize_image_renderer
     from agent_zero_cli.textual_compat import install_textual_linux_input_decoder_guard
 
     install_textual_linux_input_decoder_guard()
+    image_renderer = initialize_image_renderer()
 
     from agent_zero_cli.app import AgentZeroCLI
 
@@ -183,6 +223,7 @@ def _run_app(
         auto_connect_single_instance=auto_connect_single,
         discover_instances=discover_instances,
         connect_configured_host=connect_configured_host,
+        image_renderer=image_renderer,
     )
     app.run()
 
@@ -203,6 +244,9 @@ def _run_headless(
     print_prompt: str | None = None,
     workspace: str = ".",
     discover_instances: bool = True,
+    launcher_tag: bool = False,
+    agent_profile: str = "",
+    attachment_refs: Sequence[str] = (),
 ) -> int:
     from agent_zero_cli.config import load_config
     from agent_zero_cli.headless.runner import HeadlessOptions, run_headless
@@ -225,6 +269,9 @@ def _run_headless(
             print_prompt=print_prompt,
             workspace=Path(workspace),
             discover_instances=discover_instances,
+            launcher_tag=launcher_tag,
+            agent_profile=agent_profile,
+            attachment_refs=list(attachment_refs),
             config=config,
         )
     )
@@ -257,9 +304,37 @@ def _run_gateway(
     return run_gateway(options, config)
 
 
+def _run_acp(
+    *,
+    host: str,
+    workspace: str,
+    discover_instances: bool,
+    check: bool,
+    debug: bool,
+    transport: str | None,
+    container_id: str | None,
+) -> int:
+    from agent_zero_cli.acp import AcpOptions, run_acp
+
+    return run_acp(
+        AcpOptions(
+            host=host,
+            workspace=Path(workspace),
+            discover_instances=discover_instances,
+            check=check,
+            debug=debug,
+            transport=transport or "",
+            container_id=container_id or "",
+        )
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if sys.platform == "win32" and args.command in {"headless", "gateway"}:
+        _configure_windows_machine_stdio()
 
     if args.version:
         print(__version__)
@@ -278,6 +353,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             print_prompt=args.print_prompt,
             workspace=args.workspace,
             discover_instances=not args.headless_no_docker_discovery,
+            launcher_tag=bool(args.launcher_tag),
+            agent_profile=args.agent_profile,
+            attachment_refs=args.attachment_refs,
         )
 
     if args.command == "gateway":
@@ -289,6 +367,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             master_enabled=args.gateway_master,
             scopes=args.scopes,
             browser_selection=args.browser_selection,
+        )
+
+    if args.command == "acp":
+        return _run_acp(
+            host=(args.acp_host or args.host or ""),
+            workspace=args.workspace,
+            discover_instances=not args.no_docker_discovery,
+            check=bool(args.check),
+            debug=bool(args.debug),
+            transport=args.transport,
+            container_id=args.container_id,
         )
 
     _run_app(

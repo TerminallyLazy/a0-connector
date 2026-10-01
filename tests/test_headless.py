@@ -12,11 +12,37 @@ import pytest
 from agent_zero_cli.config import CLIConfig
 from agent_zero_cli.headless.commands import command_may_start_agent, dispatch_headless_command
 from agent_zero_cli.headless.renderer import JsonlRenderer, TextRenderer
-from agent_zero_cli.headless.runner import HeadlessOptions, HeadlessRunner
+from agent_zero_cli.headless.runner import (
+    HeadlessOptions,
+    HeadlessRunner,
+    normalize_launcher_tag_attachment_ref,
+    parse_launcher_tag_result,
+)
 from agent_zero_cli.session import SessionError
 
 
 pytestmark = pytest.mark.anyio
+
+
+class RecordingStream(io.StringIO):
+    def __init__(
+        self,
+        writes: list[tuple[str, str]],
+        label: str,
+        *,
+        is_tty: bool = False,
+    ) -> None:
+        super().__init__()
+        self._writes = writes
+        self._label = label
+        self._is_tty = is_tty
+
+    def write(self, value: str) -> int:
+        self._writes.append((self._label, value))
+        return super().write(value)
+
+    def isatty(self) -> bool:
+        return self._is_tty
 
 
 class FakeSession:
@@ -34,12 +60,16 @@ class FakeSession:
         workspace: Path,
         remote_file_write_enabled: bool,
         remote_exec_enabled: bool,
+        remote_files_enabled: bool = True,
+        remember_context: bool = True,
     ) -> None:
         self.config = config
         self.observer = observer
         self.workspace = workspace
         self.remote_file_write_enabled = remote_file_write_enabled
         self.remote_exec_enabled = remote_exec_enabled
+        self.remote_files_enabled = remote_files_enabled
+        self.remember_context = remember_context
         self.remote_files = SimpleNamespace(scan_root=str(workspace))
         self.connector_features = {"message_queue", "chat_create"}
         self.host = ""
@@ -48,6 +78,8 @@ class FakeSession:
         self.message_queue = [dict(item) for item in FakeSession.initial_queue]
         self.goal: dict[str, Any] | None = None
         self.sent: list[str] = []
+        self.sent_attachments: list[list[str] | None] = []
+        self.new_chat_agent_profile = ""
         self.queue_send_calls: list[tuple[str | None, bool]] = []
         self.queue_remove_calls: list[str | None] = []
         self.goal_calls: list[tuple[str, dict[str, Any]]] = []
@@ -63,19 +95,21 @@ class FakeSession:
         context_id: str = "",
         chat_last: bool = False,
         new_chat: bool = False,
+        new_chat_agent_profile: str = "",
         restore_session: bool = True,
     ) -> str:
         del username, password, chat_last, restore_session
         if FakeSession.connect_error is not None:
             raise FakeSession.connect_error
         self.host = host
+        self.new_chat_agent_profile = new_chat_agent_profile
         self.context_id = context_id or ("ctx-new" if new_chat else "ctx-1")
         self.observer.on_stage("ready", "Ready when you are.", host)
         return self.context_id
 
     async def send_message(self, text: str, attachments: list[str] | None = None) -> dict[str, Any]:
-        del attachments
         self.sent.append(text)
+        self.sent_attachments.append(list(attachments) if attachments else None)
         self.agent_active = True
         self.observer.on_event(
             {
@@ -242,6 +276,37 @@ def test_jsonl_renderer_emits_valid_records() -> None:
     assert payload["event"] == "assistant_message"
 
 
+def test_launcher_tag_result_parser_accepts_exact_modes_and_fails_closed() -> None:
+    assert parse_launcher_tag_result(
+        "<!--a0-tag:v1;mode=replace-->\nField-ready text"
+    ) == ("replace", "Field-ready text", True, "")
+    assert parse_launcher_tag_result(
+        "<!--a0-tag:v1;mode=action-->\nCompleted the workflow."
+    ) == ("action", "Completed the workflow.", True, "")
+    assert parse_launcher_tag_result(
+        "<!--a0-tag:v1;mode=replace-->\n\tIndented reply\n\n"
+    ) == ("replace", "\tIndented reply\n\n", True, "")
+
+    assert parse_launcher_tag_result("Field-ready text") == (
+        "overlay",
+        "Field-ready text",
+        False,
+        "INVALID_TAG_RESULT",
+    )
+    assert parse_launcher_tag_result(
+        "<!--a0-tag:v1;mode=replace-->\n<!--a0-tag:v1;mode=action-->\ntext"
+    )[2:] == (False, "INVALID_TAG_RESULT")
+
+
+def test_launcher_tag_attachment_ref_accepts_only_upload_basename() -> None:
+    assert normalize_launcher_tag_attachment_ref(
+        "/a0/usr/uploads/a0-tag-123.png"
+    ) == "/a0/usr/uploads/a0-tag-123.png"
+
+    with pytest.raises(SessionError, match="one Agent Zero upload reference"):
+        normalize_launcher_tag_attachment_ref("/a0/usr/uploads/nested/image.png")
+
+
 async def test_headless_commands_status_and_tui_only(tmp_path: Path) -> None:
     session = FakeSession(
         CLIConfig(),
@@ -348,6 +413,30 @@ def test_headless_queue_send_command_is_agent_starting() -> None:
     assert command_may_start_agent("/status") is False
 
 
+def test_headless_completion_notifies_once_on_tty_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in ("A0_TERMINAL_NOTIFY", "KITTY_WINDOW_ID", "TERM_PROGRAM", "TMUX"):
+        monkeypatch.delenv(key, raising=False)
+    writes: list[tuple[str, str]] = []
+    stdout = RecordingStream(writes, "stdout")
+    stderr = RecordingStream(writes, "stderr", is_tty=True)
+    runner = HeadlessRunner(
+        HeadlessOptions(
+            output="jsonl",
+            stdout=stdout,
+            stderr=stderr,
+        )
+    )
+
+    runner.on_complete("ctx-1")
+    runner.on_complete("ctx-1")
+
+    records = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert records == [{"type": "complete", "context_id": "ctx-1"}]
+    assert stderr.getvalue() == "\x1b]777;notify;Agent Zero;Ready for input\x07"
+
+
 async def test_print_mode_jsonl_stdout_is_valid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     del monkeypatch
     stdout = io.StringIO()
@@ -374,11 +463,86 @@ async def test_print_mode_jsonl_stdout_is_valid(monkeypatch: pytest.MonkeyPatch,
     assert FakeSession.instances[-1].closed is True
 
 
-async def test_print_mode_renders_final_snapshot_update_before_complete(tmp_path: Path) -> None:
-    FakeSession.stream_text = "HEADLESS_REMOTE_EXEC_SHORT"
-    FakeSession.final_snapshot_text = "HEADLESS_REMOTE_EXEC_SHORT_OK"
+async def test_launcher_tag_mode_is_capability_silent_and_emits_normalized_result(
+    tmp_path: Path,
+) -> None:
+    FakeSession.stream_text = "<!--a0-tag:v1;mode=replace-->\nDraft answer"
+    FakeSession.final_snapshot_text = "<!--a0-tag:v1;mode=replace-->\nFinal answer"
     stdout = io.StringIO()
     stderr = io.StringIO()
+    options = HeadlessOptions(
+        host="http://agent.test",
+        new_chat=True,
+        output="jsonl",
+        print_prompt="",
+        workspace=tmp_path,
+        discover_instances=False,
+        launcher_tag=True,
+        agent_profile="developer",
+        attachment_refs=[
+            "/a0/usr/uploads/a0-tag-window.png",
+            "/a0/usr/uploads/brief.pdf",
+        ],
+        config=CLIConfig(),
+        stdin=io.StringIO("tagged prompt"),
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    exit_code = await HeadlessRunner(options).run()
+
+    assert exit_code == 0
+    records = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert [record["type"] for record in records] == ["ready", "tag_result", "complete"]
+    assert records[1] == {
+        "type": "tag_result",
+        "context_id": "ctx-new",
+        "mode": "replace",
+        "text": "Final answer",
+        "valid": True,
+    }
+    session = FakeSession.instances[-1]
+    assert session.remote_files_enabled is False
+    assert session.remote_file_write_enabled is False
+    assert session.remote_exec_enabled is False
+    assert session.remember_context is False
+    assert session.new_chat_agent_profile == "developer"
+    assert session.sent == ["tagged prompt"]
+    assert session.sent_attachments == [[
+        "/a0/usr/uploads/a0-tag-window.png",
+        "/a0/usr/uploads/brief.pdf",
+    ]]
+    assert stderr.getvalue() == ""
+
+
+async def test_launcher_tag_mode_requires_safe_one_shot_options(tmp_path: Path) -> None:
+    stdout = io.StringIO()
+    options = HeadlessOptions(
+        host="http://agent.test",
+        output="jsonl",
+        launcher_tag=True,
+        agent_profile="developer",
+        workspace=tmp_path,
+        config=CLIConfig(),
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    assert await HeadlessRunner(options).run() == 1
+    assert json.loads(stdout.getvalue())["code"] == "INVALID_TAG_MODE"
+
+
+async def test_print_mode_renders_final_snapshot_before_complete_and_notification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for key in ("A0_TERMINAL_NOTIFY", "KITTY_WINDOW_ID", "TERM_PROGRAM", "TMUX"):
+        monkeypatch.delenv(key, raising=False)
+    FakeSession.stream_text = "HEADLESS_REMOTE_EXEC_SHORT"
+    FakeSession.final_snapshot_text = "HEADLESS_REMOTE_EXEC_SHORT_OK"
+    writes: list[tuple[str, str]] = []
+    stdout = RecordingStream(writes, "stdout")
+    stderr = RecordingStream(writes, "stderr", is_tty=True)
     options = HeadlessOptions(
         host="http://agent.test",
         output="jsonl",
@@ -397,6 +561,16 @@ async def test_print_mode_renders_final_snapshot_update_before_complete(tmp_path
     assert records[1]["data"]["text"] == "HEADLESS_REMOTE_EXEC_SHORT"
     assert records[2]["data"]["text"] == "HEADLESS_REMOTE_EXEC_SHORT_OK"
     assert records[2]["data"]["meta"]["finished"] is True
+    notification = "\x1b]777;notify;Agent Zero;Ready for input\x07"
+    assert stderr.getvalue() == notification
+    final_snapshot_write = next(
+        index for index, write in enumerate(writes) if "HEADLESS_REMOTE_EXEC_SHORT_OK" in write[1]
+    )
+    complete_write = next(
+        index for index, write in enumerate(writes) if '"type":"complete"' in write[1]
+    )
+    notification_write = writes.index(("stderr", notification))
+    assert final_snapshot_write < complete_write < notification_write
 
 
 async def test_print_mode_send_command_flushes_queue_and_waits(tmp_path: Path) -> None:

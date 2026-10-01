@@ -3,13 +3,19 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 import platform
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from agent_zero_cli.host_browser_cdp import CDPConnection, CDPContext, CDPPage
+from agent_zero_cli.host_browser_safari import (
+    SafariDriver,
+    SafariDriverError,
+    SafariPage,
+)
 from agent_zero_cli.host_browser_common import (
     DEFAULT_VIEWPORT,
     BrowserProfile,
@@ -26,19 +32,41 @@ from agent_zero_cli.host_browser_common import (
     normalize_upload_paths,
     normalize_url,
     profile_lock_state_for_profile,
+    remote_debugging_endpoint_from_user_data_dir,
+    remote_debugging_endpoint_label,
     remote_debugging_enable_hint,
     require_ref,
     screenshot_output_path,
 )
 
+_SCREENSHOT_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
+DEFAULT_EVALUATE_TIMEOUT_SECONDS = 30.0
+EVALUATE_RECOVERY_TIMEOUT_SECONDS = 5.0
+EVALUATE_TERMINATION_GRACE_SECONDS = 0.25
+
+
+def normalize_evaluate_timeout(value: Any) -> float:
+    try:
+        timeout = float(value) if not isinstance(value, bool) else 0.0
+    except (TypeError, ValueError, OverflowError):
+        timeout = 0.0
+    if not math.isfinite(timeout) or not 0.1 <= timeout <= 60:
+        raise ValueError("evaluate_timeout_seconds must be between 0.1 and 60 seconds")
+    return timeout
+
+
 @dataclass
 class HostBrowserPage:
     id: int
     page: Any
+    evaluate_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 class _RuntimeAdapter:
     close_pages_on_session_close = True
+
+    async def is_started(self, session: "HostBrowserSession") -> bool:
+        return session.context is not None
 
     async def start(self, session: "HostBrowserSession") -> None:
         raise NotImplementedError
@@ -93,17 +121,26 @@ class _CDPRuntimeAdapter(_RuntimeAdapter):
     close_pages_on_session_close = False
 
     async def start(self, session: "HostBrowserSession") -> None:
-        connection = CDPConnection(session.profile.cdp_endpoint)
-        try:
-            await connection.connect()
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                await connection.close()
-            raise RuntimeError(
-                "Cannot connect to the host browser remote-debugging endpoint "
-                f"{session.profile.cdp_endpoint}. {remote_debugging_enable_hint()} "
-                f"Original error: {exc}"
-            ) from exc
+        profile = _refreshed_remote_debugging_profile(session.profile)
+        session.profile = profile
+        for attempt in range(2):
+            connection = CDPConnection(profile.cdp_endpoint)
+            try:
+                await connection.connect()
+                break
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    await connection.close()
+                refreshed = _refreshed_remote_debugging_profile(profile)
+                if attempt or refreshed == profile:
+                    detail = str(exc).strip() or type(exc).__name__
+                    raise RuntimeError(
+                        "Cannot connect to the host browser remote-debugging endpoint "
+                        f"{profile.cdp_endpoint}. {remote_debugging_enable_hint()} "
+                        f"Original error: {detail}"
+                    ) from exc
+                profile = refreshed
+                session.profile = profile
         session.browser = connection
         session.context = CDPContext(connection)
         await session.context.discover_pages()
@@ -139,6 +176,65 @@ class _CDPRuntimeAdapter(_RuntimeAdapter):
         session.last_interacted_browser_id = None
 
 
+class _SafariRuntimeAdapter(_RuntimeAdapter):
+    close_pages_on_session_close = False
+
+    async def is_started(self, session: "HostBrowserSession") -> bool:
+        process = getattr(session.browser, "process", None)
+        if session.context is None or process is None or process.returncode is not None:
+            return False
+        try:
+            await session.browser.session_request("GET", "window/handles")
+        except SafariDriverError:
+            return False
+        return True
+
+    async def start(self, session: "HostBrowserSession") -> None:
+        driver = SafariDriver()
+        session.browser = driver
+        session.context = await driver.start()
+
+    async def refresh_pages(self, session: "HostBrowserSession") -> None:
+        discovered_pages = await session.context.discover_pages()
+        visible_pages = set(discovered_pages)
+        for browser_id, browser_page in list(session.pages.items()):
+            if browser_page.page not in visible_pages:
+                session.pages.pop(browser_id, None)
+                if session.last_interacted_browser_id == browser_id:
+                    session.last_interacted_browser_id = None
+        for page in discovered_pages:
+            await session._register_page(page)
+        if session.last_interacted_browser_id not in session.pages:
+            session.last_interacted_browser_id = next(iter(sorted(session.pages)), None)
+
+    async def current_url(self, page: Any) -> str:
+        if isinstance(page, SafariPage):
+            return await page.current_url()
+        return await super().current_url(page)
+
+    async def close_runtime(self, session: "HostBrowserSession") -> None:
+        session.pages.clear()
+        if session.browser is not None:
+            with contextlib.suppress(Exception):
+                await session.browser.close()
+        session.browser = None
+        session.context = None
+        session.last_interacted_browser_id = None
+
+
+def _refreshed_remote_debugging_profile(profile: BrowserProfile) -> BrowserProfile:
+    if not profile.is_remote_debugging or profile.user_data_dir == Path():
+        return profile
+    endpoint = remote_debugging_endpoint_from_user_data_dir(profile.user_data_dir)
+    if not endpoint or endpoint == profile.cdp_endpoint:
+        return profile
+    return replace(
+        profile,
+        profile_directory=remote_debugging_endpoint_label(endpoint),
+        cdp_endpoint=endpoint,
+    )
+
+
 @dataclass
 class HostBrowserSession:
     context_id: str
@@ -160,6 +256,8 @@ class HostBrowserSession:
 
     @property
     def _runtime(self) -> _RuntimeAdapter:
+        if self.profile.is_safari:
+            return _SafariRuntimeAdapter()
         if self.profile.is_remote_debugging:
             return _CDPRuntimeAdapter()
         return _PlaywrightRuntimeAdapter()
@@ -238,7 +336,10 @@ class HostBrowserSession:
         if action == "detail":
             return await self.detail(browser_id, require_ref(payload.get("ref"), "detail"))
         if action == "evaluate":
-            return await self.evaluate(browser_id, str(payload.get("script") or ""))
+            return await self.evaluate(
+                browser_id, payload.get("script"),
+                timeout=payload.get("evaluate_timeout_seconds", DEFAULT_EVALUATE_TIMEOUT_SECONDS),
+            )
         if action == "click":
             return await self.click(
                 browser_id,
@@ -383,14 +484,24 @@ class HostBrowserSession:
         calls = payload.get("calls")
         if not isinstance(calls, list) or not calls:
             raise ValueError("multi requires a non-empty calls list")
-        return await self.multi(calls)
+        return await self.multi([
+            {**call, "evaluate_timeout_seconds": payload.get(
+                "evaluate_timeout_seconds", DEFAULT_EVALUATE_TIMEOUT_SECONDS
+            )} if isinstance(call, dict) else call for call in calls
+        ])
+
+    async def is_started(self) -> bool:
+        return await self._runtime.is_started(self)
 
     async def ensure_started(self) -> None:
-        if self.context is not None:
+        if await self.is_started():
             return
         async with self._start_lock:
-            if self.context is not None:
+            runtime = self._runtime
+            if await self.is_started():
                 return
+            if self.context is not None:
+                await runtime.close_runtime(self)
             await self._start()
 
     async def _start(self) -> None:
@@ -561,13 +672,119 @@ class HostBrowserSession:
         self._maybe_promote(resolved_id)
         return result or {}
 
-    async def evaluate(self, browser_id: int | str | None, script: str) -> dict[str, Any]:
+    async def evaluate(
+        self, browser_id: int | str | None, script: str,
+        *, timeout: float = DEFAULT_EVALUATE_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        if not isinstance(script, str) or not script.strip():
+            raise ValueError("evaluate requires a non-empty 'script' string")
+        timeout = normalize_evaluate_timeout(timeout)
+        if self.profile and self.profile.is_safari:
+            raise RuntimeError(
+                "evaluate is unavailable for Safari: this backend cannot forcibly interrupt JavaScript. "
+                "Use a Chromium host browser or the Internal Docker browser."
+            )
         await self.ensure_started()
         resolved_id = self._resolve_browser_id(browser_id)
-        page = self._page(resolved_id)
-        result = await page.evaluate(str(script or "undefined"))
-        self._maybe_promote(resolved_id)
-        return {"result": result, "state": await self._state(resolved_id)}
+        browser_page = self.pages[resolved_id]
+        async with browser_page.evaluate_lock:
+            return await self._evaluate_page(browser_page, script, timeout)
+
+    async def _evaluate_page(
+        self, browser_page: HostBrowserPage, script: str, timeout: float
+    ) -> dict[str, Any]:
+        page = browser_page.page
+        session = page if isinstance(page, CDPPage) else await asyncio.wait_for(
+            page.context.new_cdp_session(page), EVALUATE_RECOVERY_TIMEOUT_SECONDS
+        )
+
+        async def run():
+            kwargs = {"timeout": timeout + 15} if isinstance(page, CDPPage) else {}
+            result = await page.evaluate(script, **kwargs)
+            self._maybe_promote(browser_page.id)
+            return {"result": result, "state": await self._state(browser_page.id)}
+
+        operation = asyncio.create_task(run())
+        aborted = timed_out = False
+        timeout_error = f"evaluate timed out after {timeout:g} seconds"
+        try:
+            return await asyncio.wait_for(asyncio.shield(operation), timeout)
+        except asyncio.TimeoutError:
+            aborted = timed_out = True
+            raise TimeoutError(timeout_error) from None
+        except asyncio.CancelledError:
+            aborted = True
+            raise
+        finally:
+            cleanup = asyncio.create_task(
+                self._finish_evaluate(browser_page, session, operation, aborted)
+            )
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:
+                    break
+            try:
+                recovery_notice = cleanup.result()
+            except Exception as exc:
+                if timed_out:
+                    raise TimeoutError(f"{timeout_error}; {exc}") from None
+                raise
+            if timed_out and recovery_notice:
+                raise TimeoutError(f"{timeout_error}; {recovery_notice}") from None
+            if cancelled:
+                raise asyncio.CancelledError
+
+    async def _finish_evaluate(
+        self, browser_page: HostBrowserPage, session: Any, operation: asyncio.Task, aborted: bool
+    ) -> str:
+        page = browser_page.page
+        recovery_notice = ""
+
+        async def recover():
+            if operation.done() and not operation.cancelled() and operation.exception() is None:
+                return ""
+            await session.send("Runtime.terminateExecution")
+            done, _ = await asyncio.wait({operation}, timeout=EVALUATE_TERMINATION_GRACE_SECONDS)
+            if done and not operation.cancelled() and not isinstance(
+                operation.exception(), (TimeoutError, asyncio.TimeoutError)
+            ):
+                return ""
+            # An awaited Promise may survive termination; keep the document when
+            # interruption has already settled the original protocol request.
+            await page.reload(wait_until="commit", timeout=EVALUATE_RECOVERY_TIMEOUT_SECONDS * 1000)
+            await asyncio.gather(asyncio.shield(operation), return_exceptions=True)
+            return "affected tab reloaded to cancel pending JavaScript"
+
+        try:
+            if aborted and not page.is_closed():
+                try:
+                    recovery_notice = await asyncio.wait_for(recover(), EVALUATE_RECOVERY_TIMEOUT_SECONDS)
+                except Exception:
+                    if not page.is_closed():
+                        try:
+                            kwargs = {} if isinstance(page, CDPPage) else {"run_before_unload": False}
+                            await asyncio.wait_for(page.close(**kwargs), EVALUATE_RECOVERY_TIMEOUT_SECONDS)
+                        except Exception:
+                            raise RuntimeError(
+                                "Browser evaluate recovery failed; the affected tab could not be closed"
+                            ) from None
+                    await self._unregister_page_async(browser_page.id)
+                    recovery_notice = "affected tab closed after unsuccessful recovery"
+        finally:
+            if not operation.done():
+                operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+            if session is not page:
+                try:
+                    await asyncio.wait_for(session.detach(), EVALUATE_RECOVERY_TIMEOUT_SECONDS)
+                except Exception:
+                    if not page.is_closed():
+                        raise RuntimeError("Browser evaluate protocol session cleanup failed") from None
+        return recovery_notice
 
     async def click(
         self,
@@ -969,7 +1186,20 @@ class HostBrowserSession:
             kwargs["quality"] = max(20, min(95, int(quality)))
         image = await page.screenshot(**kwargs)
         if not image and raw_path:
+            source_size = output_path.stat().st_size
+            if source_size > _SCREENSHOT_ARTIFACT_MAX_BYTES:
+                raise ValueError(
+                    "Host-browser screenshot is too large to return inline "
+                    f"({source_size} bytes, limit {_SCREENSHOT_ARTIFACT_MAX_BYTES} bytes). "
+                    "Use the saved host file through the HTTP bulk-transfer path."
+                )
             image = output_path.read_bytes()
+        if len(image) > _SCREENSHOT_ARTIFACT_MAX_BYTES:
+            raise ValueError(
+                "Host-browser screenshot is too large to return inline "
+                f"({len(image)} bytes, limit {_SCREENSHOT_ARTIFACT_MAX_BYTES} bytes). "
+                "Use the saved host file through the HTTP bulk-transfer path."
+            )
         result = {
             "browser_id": resolved_id,
             "mime": mime,

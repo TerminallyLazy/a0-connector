@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import locale
 import os
+from pathlib import Path
 import re
 import signal
 import shlex
@@ -32,7 +34,7 @@ _TIMEOUT_KEYS = (
     "max_exec_timeout",
     "dialog_timeout",
 )
-_SUPPORTED_RUNTIMES = ("terminal", "python", "nodejs", "output", "reset", "input")
+_SUPPORTED_RUNTIMES = ("terminal", "python", "nodejs", "output", "reset")
 
 _DEFAULT_CODE_EXEC_TIMEOUTS = {
     "first_output_timeout": 30,
@@ -96,6 +98,7 @@ _RESET_MESSAGE = "Terminal session has been reset."
 _PYTHON_CODE_ENV = "A0_PY_CODE"
 _NODE_CODE_ENV = "A0_NODE_CODE"
 _MARKER_PREFIX = "__A0_DONE__"
+EXEC_OUTPUT_MAX_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True)
@@ -501,10 +504,12 @@ class LocalShellSession:
             )
             return marker_pattern, wrapped
 
+        # Parse the entire group before execution so child stdin cannot consume bookkeeping.
         wrapped = (
-            f"{body}\n"
+            f"{{\n{body}\n"
             "__a0_exit=$?\n"
             f"printf '\\n{marker}:%s\\n' \"$__a0_exit\"\n"
+            "}\n"
         )
         return marker_pattern, wrapped
 
@@ -567,7 +572,7 @@ class RemoteExecManager:
         self.allow_writes = enabled
 
     def _runtime_requires_write_access(self, runtime: str) -> bool:
-        return runtime in {"terminal", "python", "nodejs", "input"}
+        return runtime in {"terminal", "python", "nodejs"}
 
     def set_exec_config(self, payload: dict[str, Any] | None) -> None:
         self._exec_config = _normalize_exec_config(payload)
@@ -599,10 +604,7 @@ class RemoteExecManager:
             return {
                 "op_id": op_id,
                 "ok": False,
-                "error": (
-                    "runtime must be one of: terminal, python, nodejs, output, reset, "
-                    "input (deprecated alias)"
-                ),
+                "error": "runtime must be one of: terminal, python, nodejs, output, reset",
             }
 
         if self._runtime_requires_write_access(runtime) and not self.allow_writes:
@@ -617,16 +619,18 @@ class RemoteExecManager:
                 "error": "session must be an integer",
             }
         reset_requested = _coerce_bool(data.get("reset"))
+        allow_running = _coerce_bool(data.get("allow_running"))
 
         try:
             if runtime == "terminal":
                 code = data.get("code")
-                if code is None or not str(code).strip():
+                if code is None or (not allow_running and not str(code).strip()):
                     raise ValueError("code is required for runtime=terminal")
                 result = await self.execute_terminal(
                     session=session,
                     command=str(code),
                     reset=reset_requested,
+                    allow_running=allow_running,
                     timeouts=self._timeouts_for_runtime(runtime, data),
                 )
             elif runtime == "python":
@@ -649,17 +653,6 @@ class RemoteExecManager:
                     reset=reset_requested,
                     timeouts=self._timeouts_for_runtime(runtime, data),
                 )
-            elif runtime == "input":
-                keyboard = data.get("keyboard")
-                if keyboard is None:
-                    keyboard = data.get("code")
-                if keyboard is None:
-                    raise ValueError("keyboard is required for runtime=input")
-                result = await self.send_input(
-                    session=session,
-                    keyboard=str(keyboard),
-                    timeouts=self._timeouts_for_runtime(runtime, data),
-                )
             elif runtime == "output":
                 result = await self.collect_output(
                     session=session,
@@ -673,7 +666,57 @@ class RemoteExecManager:
         except Exception as exc:
             return {"op_id": op_id, "ok": False, "error": str(exc)}
 
+        try:
+            result = self._bound_exec_output(result, session=session)
+        except Exception as exc:
+            return {
+                "op_id": op_id,
+                "ok": False,
+                "error": f"Could not spill oversized execution output: {exc}",
+            }
         return {"op_id": op_id, "ok": True, "result": result}
+
+    def _bound_exec_output(
+        self,
+        result: dict[str, Any],
+        *,
+        session: int,
+    ) -> dict[str, Any]:
+        output = str(result.get("output") or "")
+        encoded = output.encode("utf-8")
+        if len(encoded) <= EXEC_OUTPUT_MAX_BYTES:
+            return result
+
+        output_path = Path(self.cwd) / (
+            f"a0-exec-output-{session}-{uuid.uuid4().hex[:12]}.log"
+        )
+        temp_path = output_path.with_name(f".{output_path.name}.partial-{uuid.uuid4().hex}")
+        try:
+            with temp_path.open("xb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, output_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temp_path.unlink()
+
+        notice = (
+            f"[Output truncated to the final bytes. Full output: {output_path}]\n"
+        )
+        budget = EXEC_OUTPUT_MAX_BYTES - len(notice.encode("utf-8"))
+        tail = encoded[-budget:].decode("utf-8", errors="ignore")
+        bounded = dict(result)
+        bounded.update(
+            {
+                "output": notice + tail,
+                "output_truncated": True,
+                "output_total_bytes": len(encoded),
+                "output_file": str(output_path),
+                "output_sha256": hashlib.sha256(encoded).hexdigest(),
+            }
+        )
+        return bounded
 
     async def execute_terminal(
         self,
@@ -681,6 +724,7 @@ class RemoteExecManager:
         session: int,
         command: str,
         reset: bool = False,
+        allow_running: bool = False,
         timeouts: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         return await self._run_shell_command(
@@ -688,6 +732,7 @@ class RemoteExecManager:
             command=command,
             timeouts=timeouts or self._exec_config.code_exec_timeouts,
             reset=reset,
+            allow_running=allow_running,
         )
 
     async def execute_python(
@@ -718,29 +763,6 @@ class RemoteExecManager:
             command=_build_node_command(code),
             timeouts=timeouts or self._exec_config.code_exec_timeouts,
             reset=reset,
-        )
-
-    async def send_input(
-        self,
-        *,
-        session: int,
-        keyboard: str,
-        timeouts: dict[str, int] | None = None,
-    ) -> dict[str, Any]:
-        if session not in self._sessions or not self._sessions[session].running:
-            raise ValueError(
-                f"Session {session} is not awaiting input. runtime=input is a deprecated "
-                "compatibility alias for sending a line into a running shell session."
-            )
-
-        state = self._sessions[session]
-        await state.shell.reset_output()
-        await state.shell.send_input(keyboard.rstrip("\n"))
-        state.running = True
-        return await self._get_terminal_output(
-            session=session,
-            timeouts=timeouts or self._exec_config.code_exec_timeouts,
-            reset_full_output=False,
         )
 
     async def collect_output(
@@ -776,12 +798,21 @@ class RemoteExecManager:
         command: str,
         timeouts: dict[str, int],
         reset: bool = False,
+        allow_running: bool = False,
     ) -> dict[str, Any]:
         state = await self._ensure_session(session, reset=reset)
-        if response := await self._handle_running_session(session=session):
-            return response
+        if not allow_running:
+            if response := await self._handle_running_session(session=session):
+                return response
 
-        await state.shell.send_command(command)
+        if allow_running and state.running:
+            if "\n" in command:
+                opener = ". {" if os.name == "nt" else "{"
+                command = f"{opener}\n{command.rstrip()}\n}}"
+            await state.shell.reset_output()
+            await state.shell.send_input(command)
+        else:
+            await state.shell.send_command(command)
         state.running = True
         return await self._get_terminal_output(
             session=session,
@@ -957,11 +988,8 @@ class RemoteExecManager:
         if not lines:
             return ""
 
-        last_line = lines[-1].strip()
-        for pattern in patterns:
-            if pattern.search(last_line):
-                lines = lines[:-1]
-                break
+        if self._detect_prompt(lines[-1], patterns):
+            lines = lines[:-1]
         return "\n".join(lines).strip()
 
 

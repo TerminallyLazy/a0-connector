@@ -4,7 +4,9 @@ import argparse
 import base64
 import contextlib
 import json
+import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -55,6 +57,12 @@ _AX_DEFAULT_MAX_NODES = 200
 _AX_HARD_MAX_DEPTH = 8
 _AX_HARD_MAX_NODES = 500
 _AX_TEXT_LIMIT = 240
+_TAG_TEXT_WINDOW_CHARS = 4096
+_TAG_QUERY_MAX_CHARS = 2048
+_TAG_REPLACEMENT_MAX_CHARS = 16384
+_TAG_SCREENSHOT_MAX_BYTES = 16 * 1024 * 1024
+_TAG_TARGET_TTL_SECONDS = 15 * 60
+_TAG_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _MACOS_ACCESSIBILITY_MANUAL_APPROVAL = (
     "If no prompt appears, open System Settings > Privacy & Security > Accessibility "
     "and enable the app running a0, such as Terminal, then run /computer-use on again."
@@ -556,6 +564,25 @@ def _normalize_ax_path(value: Any) -> list[int]:
     raise ValueError("AX path must be a list of integers or a slash-delimited string.")
 
 
+def _utf16_length(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _cg_window_bounds(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        bounds = (
+            float(value.get("X", value.get("x"))),
+            float(value.get("Y", value.get("y"))),
+            float(value.get("Width", value.get("width"))),
+            float(value.get("Height", value.get("height"))),
+        )
+    except (TypeError, ValueError):
+        return None
+    return bounds if all(math.isfinite(item) for item in bounds) else None
+
+
 @dataclass(frozen=True)
 class _ResolvedKey:
     keycode: int
@@ -587,7 +614,6 @@ class _MacOSDesktopAutomation:
 
     def _capture_png_coregraphics(self) -> tuple[bytes, int, int]:
         quartz = self._quartz
-        appkit = _load_appkit_module()
         display_id = quartz.CGMainDisplayID()
         image = quartz.CGDisplayCreateImage(display_id)
         if image is None:
@@ -595,12 +621,80 @@ class _MacOSDesktopAutomation:
                 "COMPUTER_USE_CAPTURE_UNAVAILABLE",
                 "CoreGraphics did not return a display image. macOS Screen Recording permission may be required.",
             )
+        png_bytes, width, height = self._encode_cgimage_png(image)
+        self.last_capture_strategy = "coregraphics"
+        _emit_debug("driver.capture_png.coregraphics_ok", width=width, height=height, bytes=len(png_bytes))
+        return png_bytes, width, height
 
+    def capture_window_png(
+        self,
+        *,
+        pid: int,
+        bounds: tuple[float, float, float, float],
+        title: str,
+    ) -> tuple[bytes, int, int, int]:
+        quartz = self._quartz
+        options = int(getattr(quartz, "kCGWindowListOptionOnScreenOnly", 1)) | int(
+            getattr(quartz, "kCGWindowListExcludeDesktopElements", 16)
+        )
+        window_info = quartz.CGWindowListCopyWindowInfo(
+            options,
+            getattr(quartz, "kCGNullWindowID", 0),
+        ) or []
+        matches: list[tuple[int, str]] = []
+        owner_pid_key = getattr(quartz, "kCGWindowOwnerPID", "kCGWindowOwnerPID")
+        bounds_key = getattr(quartz, "kCGWindowBounds", "kCGWindowBounds")
+        number_key = getattr(quartz, "kCGWindowNumber", "kCGWindowNumber")
+        title_key = getattr(quartz, "kCGWindowName", "kCGWindowName")
+        layer_key = getattr(quartz, "kCGWindowLayer", "kCGWindowLayer")
+        for item in window_info:
+            if int(item.get(owner_pid_key, -1)) != pid or int(item.get(layer_key, 0)) != 0:
+                continue
+            native_bounds = _cg_window_bounds(item.get(bounds_key))
+            if native_bounds is None or any(
+                abs(actual - expected) > 2.0
+                for actual, expected in zip(native_bounds, bounds, strict=True)
+            ):
+                continue
+            try:
+                window_number = int(item[number_key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            matches.append((window_number, str(item.get(title_key) or "")))
+        if len(matches) > 1 and title:
+            titled = [match for match in matches if match[1] == title]
+            if len(titled) == 1:
+                matches = titled
+        if len(matches) != 1:
+            raise MacOSComputerUseError(
+                "A0_TAG_SCREENSHOT_UNAVAILABLE",
+                "CoreGraphics did not expose one verified active window with matching native bounds.",
+            )
+
+        window_number = matches[0][0]
+        image = quartz.CGWindowListCreateImage(
+            getattr(quartz, "CGRectNull"),
+            getattr(quartz, "kCGWindowListOptionIncludingWindow", 8),
+            window_number,
+            int(getattr(quartz, "kCGWindowImageBoundsIgnoreFraming", 1))
+            | int(getattr(quartz, "kCGWindowImageBestResolution", 8)),
+        )
+        if image is None:
+            raise MacOSComputerUseError(
+                "A0_TAG_SCREENSHOT_UNAVAILABLE",
+                "CoreGraphics could not capture the verified active window.",
+            )
+        png_bytes, width, height = self._encode_cgimage_png(image)
+        self.last_capture_strategy = "coregraphics-window"
+        return png_bytes, width, height, window_number
+
+    def _encode_cgimage_png(self, image: Any) -> tuple[bytes, int, int]:
+        appkit = _load_appkit_module()
         image_rep = appkit.NSBitmapImageRep.alloc().initWithCGImage_(image)
         if image_rep is None:
             raise MacOSComputerUseError(
                 "COMPUTER_USE_CAPTURE_UNAVAILABLE",
-                "Unable to create a macOS bitmap representation for the display image.",
+                "Unable to create a macOS bitmap representation for the captured image.",
             )
 
         png_type = getattr(appkit, "NSBitmapImageFileTypePNG", getattr(appkit, "NSPNGFileType", 4))
@@ -613,8 +707,6 @@ class _MacOSDesktopAutomation:
 
         png_bytes = bytes(png_data)
         width, height = _png_dimensions(png_bytes)
-        self.last_capture_strategy = "coregraphics"
-        _emit_debug("driver.capture_png.coregraphics_ok", width=width, height=height, bytes=len(png_bytes))
         return png_bytes, width, height
 
     def _capture_png_screencapture(
@@ -975,6 +1067,25 @@ class _RuntimeSession:
     policy: TrustModePolicy
 
 
+@dataclass
+class _TagTarget:
+    token: str
+    pid: int
+    bundle_id: str
+    app_name: str
+    window_title: str
+    window_id: str
+    window_bounds: tuple[float, float, float, float]
+    window: Any = field(repr=False)
+    element: Any = field(repr=False)
+    start: int
+    end: int
+    caret: int
+    original: str
+    editable: bool
+    captured_at: float
+
+
 class MacOSComputerUseRuntime:
     def __init__(
         self,
@@ -993,6 +1104,7 @@ class MacOSComputerUseRuntime:
         )
         self._session: _RuntimeSession | None = None
         self._element_index_cache: dict[int, dict[str, Any]] = {}
+        self._tag_target: _TagTarget | None = None
 
     @property
     def supported(self) -> bool:
@@ -1041,6 +1153,9 @@ class MacOSComputerUseRuntime:
             "start_session": self.start_session,
             "status": self.status,
             "capture": self.capture,
+            "tag_context": self.tag_context,
+            "tag_replace": self.tag_replace,
+            "tag_release": self.tag_release,
             "list_windows": self.list_windows,
             "get_window_state": self.get_window_state,
             "element_action": self.element_action,
@@ -1180,13 +1295,16 @@ class MacOSComputerUseRuntime:
             allow=allow,
         )
         _emit_debug("start_session.accessibility.ok", context_id=context_id)
-        _emit_debug("start_session.capture_probe.begin", context_id=context_id)
-        width, height = self._probe_capture_dimensions(
-            allow_prompt=allow_prompt,
-            timeout=request_timeout,
-            allow=allow,
-        )
-        _emit_debug("start_session.capture_probe.ok", context_id=context_id, width=width, height=height)
+        if context_id == "launcher-tag":
+            width, height = 0, 0
+        else:
+            _emit_debug("start_session.capture_probe.begin", context_id=context_id)
+            width, height = self._probe_capture_dimensions(
+                allow_prompt=allow_prompt,
+                timeout=request_timeout,
+                allow=allow,
+            )
+            _emit_debug("start_session.capture_probe.ok", context_id=context_id, width=width, height=height)
 
         reusable = self._store.get(context_id)
         if reusable is not None and policy.reuse_allowed and reusable.restore_token == restore_token:
@@ -1270,6 +1388,247 @@ class MacOSComputerUseRuntime:
         else:
             result["png_base64"] = base64.b64encode(png_bytes).decode("ascii")
         return result
+
+    def tag_context(self, params: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_session(params)
+        self._tag_target = None
+        accessibility = _load_accessibility_module()
+        app_info, app_root = self._frontmost_ax_root(accessibility)
+        try:
+            pid = int(app_info.get("pid"))
+        except (TypeError, ValueError):
+            raise MacOSComputerUseError(
+                "A0_TAG_FOCUS_UNAVAILABLE",
+                "The frontmost macOS application has no verifiable process identity.",
+            ) from None
+        window = _ax_copy_attribute(
+            accessibility,
+            app_root,
+            "kAXFocusedWindowAttribute",
+            "AXFocusedWindow",
+        )
+        element = _ax_copy_attribute(
+            accessibility,
+            app_root,
+            "kAXFocusedUIElementAttribute",
+            "AXFocusedUIElement",
+        )
+        if window is None or element is None:
+            raise MacOSComputerUseError(
+                "A0_TAG_FOCUS_UNAVAILABLE",
+                "No accessible focused field was found in the frontmost macOS window.",
+            )
+        element_window = _ax_copy_attribute(
+            accessibility,
+            element,
+            "kAXWindowAttribute",
+            "AXWindow",
+        )
+        if element_window is not None and not self._ax_elements_equal(
+            accessibility,
+            element_window,
+            window,
+        ):
+            raise MacOSComputerUseError(
+                "A0_TAG_WINDOW_INACTIVE",
+                "The focused field is not inside the active macOS window.",
+            )
+        if self._tag_element_protected(accessibility, element):
+            raise MacOSComputerUseError(
+                "A0_TAG_PROTECTED_FIELD",
+                "A0 Tag is unavailable in protected fields.",
+            )
+
+        start, end, caret, original, query, profile, focused_context = self._parse_tag_invocation(
+            accessibility,
+            element,
+        )
+        editable = self._tag_element_editable(accessibility, element)
+        screen_size = (session.session.width, session.session.height)
+        frame = self._ax_frame(accessibility, window, screen_size=screen_size)
+        bounds = (
+            float(frame.get("x", 0.0)) if frame else 0.0,
+            float(frame.get("y", 0.0)) if frame else 0.0,
+            float(frame.get("width", 0.0)) if frame else 0.0,
+            float(frame.get("height", 0.0)) if frame else 0.0,
+        )
+        windows = _ax_iterable(
+            _ax_copy_attribute(accessibility, app_root, "kAXWindowsAttribute", "AXWindows")
+        )
+        window_path = next(
+            ([index] for index, candidate in enumerate(windows) if self._ax_elements_equal(accessibility, candidate, window)),
+            [],
+        )
+        window_id = self._window_id_for_ax_window(app_info, path=window_path)
+        app_name = _bounded_text(app_info.get("name") or "macOS app", limit=128)
+        window_title = _bounded_text(
+            _ax_copy_attribute(accessibility, window, "kAXTitleAttribute", "AXTitle") or app_name,
+            limit=240,
+        )
+        budget: dict[str, Any] = {"count": 0, "truncated": False}
+        tree = self._serialize_ax_element(
+            accessibility,
+            window,
+            path=window_path,
+            depth=0,
+            max_depth=5,
+            max_nodes=120,
+            budget=budget,
+            screen_size=screen_size,
+        ) or {}
+        target = _TagTarget(
+            token=uuid.uuid4().hex,
+            pid=pid,
+            bundle_id=_bounded_text(app_info.get("bundle_id"), limit=256),
+            app_name=app_name,
+            window_title=window_title,
+            window_id=window_id,
+            window_bounds=bounds,
+            window=window,
+            element=element,
+            start=start,
+            end=end,
+            caret=caret,
+            original=original,
+            editable=editable,
+            captured_at=time.time(),
+        )
+        self._tag_target = target
+
+        screenshot_status, screenshot_error, artifact = self._tag_window_screenshot(target)
+        return {
+            "session_id": session.session.session_id,
+            "context_id": session.session.context_id,
+            "target_token": target.token,
+            "tag_text": original,
+            "query": query,
+            "profile_override": profile,
+            "app_name": app_name,
+            "window_title": window_title,
+            "window_id": window_id,
+            "focused_text": focused_context,
+            "tree": tree,
+            "tree_truncated": bool(budget["truncated"]),
+            "replace_supported": editable,
+            "screenshot_status": screenshot_status,
+            **({"screenshot_error": screenshot_error} if screenshot_error else {}),
+            **({"artifact": artifact} if artifact is not None else {}),
+        }
+
+    def tag_replace(self, params: dict[str, Any]) -> dict[str, Any]:
+        session = self._require_session(params)
+        token = str(params.get("target_token") or "").strip()
+        replacement = str(params.get("replacement") or "")
+        target = self._tag_target
+        if target is None or not token or token != target.token:
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_EXPIRED",
+                "The original A0 Tag field is no longer available.",
+            )
+        if time.time() - target.captured_at > _TAG_TARGET_TTL_SECONDS:
+            self._tag_target = None
+            raise MacOSComputerUseError("A0_TAG_TARGET_EXPIRED", "The original A0 Tag field expired.")
+        if not target.editable:
+            raise MacOSComputerUseError(
+                "A0_TAG_REPLACE_UNSUPPORTED",
+                "The tagged field does not support safe replacement.",
+            )
+        if not replacement or len(replacement) > _TAG_REPLACEMENT_MAX_CHARS:
+            raise MacOSComputerUseError(
+                "A0_TAG_INVALID_REPLACEMENT",
+                "A0 Tag replacement must contain 1 to 16384 characters.",
+            )
+
+        accessibility = _load_accessibility_module()
+        app_info, app_root = self._frontmost_ax_root(accessibility)
+        if (
+            str(app_info.get("pid") or "") != str(target.pid)
+            or _bounded_text(app_info.get("bundle_id"), limit=256) != target.bundle_id
+        ):
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_CHANGED",
+                "The frontmost application changed while Agent Zero was working.",
+            )
+        window = _ax_copy_attribute(
+            accessibility,
+            app_root,
+            "kAXFocusedWindowAttribute",
+            "AXFocusedWindow",
+        )
+        element = _ax_copy_attribute(
+            accessibility,
+            app_root,
+            "kAXFocusedUIElementAttribute",
+            "AXFocusedUIElement",
+        )
+        if (
+            window is None
+            or element is None
+            or not self._ax_elements_equal(accessibility, window, target.window)
+            or not self._ax_elements_equal(accessibility, element, target.element)
+        ):
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_CHANGED",
+                "The active window or focused field changed while Agent Zero was working.",
+            )
+        element_window = _ax_copy_attribute(
+            accessibility,
+            element,
+            "kAXWindowAttribute",
+            "AXWindow",
+        )
+        current_title = _bounded_text(
+            _ax_copy_attribute(accessibility, window, "kAXTitleAttribute", "AXTitle") or target.app_name,
+            limit=240,
+        )
+        if (
+            (element_window is not None and not self._ax_elements_equal(accessibility, element_window, window))
+            or current_title != target.window_title
+        ):
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_CHANGED",
+                "The active window changed while Agent Zero was working.",
+            )
+        if self._tag_element_protected(accessibility, element):
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_CHANGED",
+                "The tagged field became protected while Agent Zero was working.",
+            )
+        if not self._tag_element_editable(accessibility, element):
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_CHANGED",
+                "The tagged field is no longer safely editable.",
+            )
+        if self._tag_selected_range(accessibility, element) != (target.caret, 0):
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_CHANGED",
+                "The caret moved while Agent Zero was working.",
+            )
+        try:
+            current = self._tag_text_range(accessibility, element, target.start, target.end)
+        except MacOSComputerUseError:
+            current = None
+        if current != target.original:
+            raise MacOSComputerUseError(
+                "A0_TAG_TARGET_CHANGED",
+                "The original A0 Tag text changed while Agent Zero was working.",
+            )
+
+        self._replace_tag_text(accessibility, target, replacement)
+        self._tag_target = None
+        return {
+            "session_id": session.session.session_id,
+            "replaced": True,
+            "characters": len(replacement),
+        }
+
+    def tag_release(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._require_session(params)
+        token = str(params.get("target_token") or "").strip()
+        released = self._tag_target is not None and token == self._tag_target.token
+        if released:
+            self._tag_target = None
+        return {"released": released}
 
     def list_windows(self, params: dict[str, Any]) -> dict[str, Any]:
         session = self._require_session(params)
@@ -1576,6 +1935,7 @@ class MacOSComputerUseRuntime:
 
     def stop_session(self, params: dict[str, Any]) -> dict[str, Any]:
         context_id = normalize_context_id(params.get("context_id"))
+        self._tag_target = None
         session = self._session
         if session is not None and session.session.context_id == context_id:
             session.session.active = False
@@ -1584,6 +1944,413 @@ class MacOSComputerUseRuntime:
                 self._store.put(session.session)
             self._session = None
         return {"active": False, "status": "stopped", "session_id": ""}
+
+    def _parse_tag_invocation(
+        self,
+        accessibility: Any,
+        element: Any,
+    ) -> tuple[int, int, int, str, str, str, str]:
+        character_count = self._tag_text_count(accessibility, element)
+        caret, selection_length = self._tag_selected_range(accessibility, element)
+        if character_count <= 0 or caret < 0 or caret > character_count or selection_length != 0:
+            raise MacOSComputerUseError(
+                "A0_TAG_TEXT_UNAVAILABLE",
+                "The focused field has no readable caret text.",
+            )
+
+        before_start = max(0, caret - _TAG_TEXT_WINDOW_CHARS)
+        before_start, _, before = self._tag_bounded_text_range(
+            accessibility,
+            element,
+            before_start,
+            caret,
+            trim_start=True,
+        )
+        newline = max(before.rfind("\n"), before.rfind("\r"))
+        if newline < 0 and before_start > 0:
+            raise MacOSComputerUseError("A0_TAG_QUERY_TOO_LONG", "The A0 Tag line is too long.")
+        line_start = before_start + _utf16_length(before[: newline + 1])
+        line = before[newline + 1 :]
+
+        after_end = min(character_count, caret + _TAG_TEXT_WINDOW_CHARS)
+        _, after_end, after = self._tag_bounded_text_range(
+            accessibility,
+            element,
+            caret,
+            after_end,
+            trim_start=False,
+        )
+        after_line = re.split(r"[\r\n]", after, maxsplit=1)[0]
+        after_line_bounded = "\n" in after or "\r" in after or after_end == character_count
+        if not after_line_bounded or after_line.strip():
+            raise MacOSComputerUseError(
+                "A0_TAG_CARET_POSITION",
+                "Place the caret at the end of the A0 Tag request.",
+            )
+
+        match = re.fullmatch(
+            r"(?P<indent>[ \t]*)(?P<tag>@a0(?:\.(?P<profile>[A-Za-z0-9][A-Za-z0-9_-]{0,63}))?[ \t]+(?P<query>.*?))(?P<trailing>[ \t]*)",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            raise MacOSComputerUseError(
+                "A0_TAG_NOT_FOUND",
+                "The focused line does not contain a valid @a0 request.",
+            )
+        query = str(match.group("query") or "").strip()
+        if not query:
+            raise MacOSComputerUseError("A0_TAG_EMPTY_QUERY", "A0 Tag requires a request after the tag.")
+        if len(query) > _TAG_QUERY_MAX_CHARS:
+            raise MacOSComputerUseError(
+                "A0_TAG_QUERY_TOO_LONG",
+                "A0 Tag requests are limited to 2048 characters.",
+            )
+        profile = str(match.group("profile") or "")
+        if profile and not _TAG_PROFILE_RE.fullmatch(profile):
+            raise MacOSComputerUseError("A0_TAG_INVALID_PROFILE", "The A0 Tag profile key is invalid.")
+        original = str(match.group("tag") or "")
+        start = line_start + _utf16_length(str(match.group("indent") or ""))
+        end = start + _utf16_length(original)
+        context_start = max(0, start - _TAG_TEXT_WINDOW_CHARS)
+        context_end = min(character_count, end + _TAG_TEXT_WINDOW_CHARS)
+        _, _, context_before = self._tag_bounded_text_range(
+            accessibility,
+            element,
+            context_start,
+            start,
+            trim_start=True,
+        )
+        _, _, context_after = self._tag_bounded_text_range(
+            accessibility,
+            element,
+            end,
+            context_end,
+            trim_start=False,
+        )
+        focused_context = context_before + original + context_after
+        return start, end, caret, original, query, profile, focused_context
+
+    def _tag_text_count(self, accessibility: Any, element: Any) -> int:
+        value = _ax_copy_attribute(
+            accessibility,
+            element,
+            "kAXNumberOfCharactersAttribute",
+            "AXNumberOfCharacters",
+        )
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise MacOSComputerUseError(
+                "A0_TAG_TEXT_UNAVAILABLE",
+                "The focused field does not expose bounded readable text.",
+            ) from None
+
+    def _tag_selected_range(self, accessibility: Any, element: Any) -> tuple[int, int]:
+        value = _ax_copy_attribute(
+            accessibility,
+            element,
+            "kAXSelectedTextRangeAttribute",
+            "AXSelectedTextRange",
+        )
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return int(value[0]), int(value[1])
+            except (TypeError, ValueError):
+                pass
+        get_value = getattr(accessibility, "AXValueGetValue", None)
+        range_type = getattr(accessibility, "kAXValueCFRangeType", 4)
+        if callable(get_value) and value is not None:
+            try:
+                result = get_value(value, range_type, None)
+                success, native_range = result if isinstance(result, tuple) and len(result) >= 2 else (False, None)
+                if success and isinstance(native_range, (list, tuple)) and len(native_range) >= 2:
+                    return int(native_range[0]), int(native_range[1])
+            except Exception:
+                pass
+        raise MacOSComputerUseError(
+            "A0_TAG_TEXT_UNAVAILABLE",
+            "The focused field does not expose a readable caret range.",
+        )
+
+    def _tag_range_value(self, accessibility: Any, start: int, length: int) -> Any:
+        create_value = getattr(accessibility, "AXValueCreate", None)
+        if callable(create_value):
+            try:
+                return create_value(getattr(accessibility, "kAXValueCFRangeType", 4), (start, length))
+            except Exception:
+                pass
+        return (start, length)
+
+    def _tag_text_range(self, accessibility: Any, element: Any, start: int, end: int) -> str:
+        if start < 0 or end < start:
+            raise MacOSComputerUseError("A0_TAG_TEXT_UNAVAILABLE", "The focused text range is invalid.")
+        copy_value = getattr(accessibility, "AXUIElementCopyParameterizedAttributeValue", None)
+        if not callable(copy_value):
+            raise MacOSComputerUseError(
+                "A0_TAG_TEXT_UNAVAILABLE",
+                "The focused field does not expose bounded readable text.",
+            )
+        attribute = _ax_constant(
+            accessibility,
+            "kAXStringForRangeParameterizedAttribute",
+            "AXStringForRange",
+        )
+        native_range = self._tag_range_value(accessibility, start, end - start)
+        try:
+            result = copy_value(element, attribute, native_range, None)
+        except TypeError:
+            result = copy_value(element, attribute, native_range)
+        except Exception as exc:
+            raise MacOSComputerUseError(
+                "A0_TAG_TEXT_UNAVAILABLE",
+                "The focused field rejected a bounded text read.",
+            ) from exc
+        error_code, value = _ax_result_value(result)
+        if error_code != 0 or value is None:
+            raise MacOSComputerUseError(
+                "A0_TAG_TEXT_UNAVAILABLE",
+                "The focused field rejected a bounded text read.",
+            )
+        return str(value)
+
+    def _tag_bounded_text_range(
+        self,
+        accessibility: Any,
+        element: Any,
+        start: int,
+        end: int,
+        *,
+        trim_start: bool,
+    ) -> tuple[int, int, str]:
+        try:
+            return start, end, self._tag_text_range(accessibility, element, start, end)
+        except MacOSComputerUseError:
+            if start >= end:
+                raise
+        if trim_start:
+            start += 1
+        else:
+            end -= 1
+        return start, end, self._tag_text_range(accessibility, element, start, end)
+
+    def _tag_element_protected(self, accessibility: Any, element: Any) -> bool:
+        role = str(_ax_copy_attribute(accessibility, element, "kAXRoleAttribute", "AXRole") or "")
+        subrole = str(_ax_copy_attribute(accessibility, element, "kAXSubroleAttribute", "AXSubrole") or "")
+        protected = _ax_copy_attribute(
+            accessibility,
+            element,
+            "kAXProtectedContentAttribute",
+            "AXProtectedContent",
+        )
+        semantic_role = f"{role} {subrole}".casefold()
+        return bool(protected) or "password" in semantic_role or "secure" in semantic_role
+
+    def _tag_element_editable(self, accessibility: Any, element: Any) -> bool:
+        enabled = _ax_copy_attribute(accessibility, element, "kAXEnabledAttribute", "AXEnabled")
+        if enabled is False:
+            return False
+        return self._ax_attribute_settable(
+            accessibility,
+            element,
+            _ax_constant(accessibility, "kAXSelectedTextRangeAttribute", "AXSelectedTextRange"),
+        ) and self._ax_attribute_settable(
+            accessibility,
+            element,
+            _ax_constant(accessibility, "kAXSelectedTextAttribute", "AXSelectedText"),
+        )
+
+    def _ax_attribute_settable(self, accessibility: Any, element: Any, attribute: Any) -> bool:
+        is_settable = getattr(accessibility, "AXUIElementIsAttributeSettable", None)
+        if not callable(is_settable):
+            return False
+        try:
+            result = is_settable(element, attribute, None)
+        except TypeError:
+            result = is_settable(element, attribute)
+        except Exception:
+            return False
+        error_code, value = _ax_result_value(result)
+        return error_code == 0 and bool(value)
+
+    def _ax_elements_equal(self, accessibility: Any, left: Any, right: Any) -> bool:
+        if left is right:
+            return True
+        equal = getattr(accessibility, "CFEqual", None)
+        if callable(equal):
+            with contextlib.suppress(Exception):
+                return bool(equal(left, right))
+        with contextlib.suppress(Exception):
+            return bool(left == right)
+        return False
+
+    def _tag_window_screenshot(
+        self,
+        target: _TagTarget,
+    ) -> tuple[str, str, dict[str, str] | None]:
+        if (
+            not all(math.isfinite(item) for item in target.window_bounds)
+            or target.window_bounds[2] <= 0
+            or target.window_bounds[3] <= 0
+        ):
+            return (
+                "unavailable",
+                "macOS Accessibility did not expose verified active-window bounds; A0 Tag continued without a screenshot.",
+                None,
+            )
+        try:
+            quartz = _load_quartz_module()
+        except MacOSComputerUseError as exc:
+            return "unavailable", str(exc), None
+        try:
+            screen_recording_granted = self._screen_recording_granted(quartz)
+        except Exception:
+            return (
+                "unavailable",
+                "macOS Screen Recording permission could not be verified; A0 Tag continued without a screenshot.",
+                None,
+            )
+        if not screen_recording_granted:
+            return (
+                "unavailable",
+                "macOS Screen Recording permission is unavailable; A0 Tag continued without a screenshot.",
+                None,
+            )
+        capture_window = getattr(self._driver, "capture_window_png", None)
+        if not callable(capture_window):
+            return (
+                "unavailable",
+                "The macOS backend cannot capture a verified active window; A0 Tag continued without a screenshot.",
+                None,
+            )
+        try:
+            png_bytes, _width, _height, _window_number = capture_window(
+                pid=target.pid,
+                bounds=target.window_bounds,
+                title=target.window_title,
+            )
+        except MacOSComputerUseError as exc:
+            return "unavailable", str(exc), None
+        except Exception:
+            return (
+                "unavailable",
+                "The verified active-window screenshot failed; A0 Tag continued without a screenshot.",
+                None,
+            )
+        if not png_bytes.startswith(b"\x89PNG\r\n\x1a\n") or len(png_bytes) > _TAG_SCREENSHOT_MAX_BYTES:
+            return (
+                "unavailable",
+                "The verified active-window screenshot was invalid or too large; A0 Tag continued without it.",
+                None,
+            )
+        return (
+            "attached",
+            "",
+            {
+                "encoding": "base64",
+                "mime": "image/png",
+                "filename": "a0-tag-window.png",
+                "data": base64.b64encode(png_bytes).decode("ascii"),
+            },
+        )
+
+    def _replace_tag_text(
+        self,
+        accessibility: Any,
+        target: _TagTarget,
+        replacement: str,
+    ) -> None:
+        original_count = self._tag_text_count(accessibility, target.element)
+        replacement_length = _utf16_length(replacement)
+        replacement_caret = target.start + replacement_length + (target.caret - target.end)
+        expected_count = original_count - (target.end - target.start) + replacement_length
+        range_attribute = _ax_constant(
+            accessibility,
+            "kAXSelectedTextRangeAttribute",
+            "AXSelectedTextRange",
+        )
+        text_attribute = _ax_constant(accessibility, "kAXSelectedTextAttribute", "AXSelectedText")
+        if self._set_ax_attribute(
+            accessibility,
+            target.element,
+            range_attribute,
+            self._tag_range_value(accessibility, target.start, target.end - target.start),
+        ) != 0:
+            raise MacOSComputerUseError(
+                "A0_TAG_REPLACE_FAILED",
+                "The focused field rejected exact range selection.",
+            )
+        write_error = self._set_ax_attribute(accessibility, target.element, text_attribute, replacement)
+        try:
+            actual_count = self._tag_text_count(accessibility, target.element)
+            actual = self._tag_text_range(
+                accessibility,
+                target.element,
+                target.start,
+                target.start + replacement_length,
+            )
+        except MacOSComputerUseError:
+            actual_count = expected_count
+            actual = ""
+        caret_error = self._set_ax_attribute(
+            accessibility,
+            target.element,
+            range_attribute,
+            self._tag_range_value(accessibility, replacement_caret, 0),
+        )
+        caret_ok = False
+        if caret_error == 0:
+            with contextlib.suppress(MacOSComputerUseError):
+                caret_ok = self._tag_selected_range(accessibility, target.element) == (
+                    replacement_caret,
+                    0,
+                )
+        if write_error == 0 and actual_count == expected_count and actual == replacement and caret_ok:
+            return
+
+        self._restore_tag_text(
+            accessibility,
+            target,
+            current_count=actual_count,
+            original_count=original_count,
+        )
+        raise MacOSComputerUseError(
+            "A0_TAG_REPLACE_FAILED",
+            "The field changed or rejected the replacement; the original tag was restored where possible.",
+        )
+
+    def _restore_tag_text(
+        self,
+        accessibility: Any,
+        target: _TagTarget,
+        *,
+        current_count: int,
+        original_count: int,
+    ) -> None:
+        inserted_length = current_count - (original_count - (target.end - target.start))
+        if inserted_length < 0 or inserted_length > _TAG_REPLACEMENT_MAX_CHARS * 2:
+            return
+        range_attribute = _ax_constant(
+            accessibility,
+            "kAXSelectedTextRangeAttribute",
+            "AXSelectedTextRange",
+        )
+        text_attribute = _ax_constant(accessibility, "kAXSelectedTextAttribute", "AXSelectedText")
+        if self._set_ax_attribute(
+            accessibility,
+            target.element,
+            range_attribute,
+            self._tag_range_value(accessibility, target.start, inserted_length),
+        ) != 0:
+            return
+        if self._set_ax_attribute(accessibility, target.element, text_attribute, target.original) != 0:
+            return
+        self._set_ax_attribute(
+            accessibility,
+            target.element,
+            range_attribute,
+            self._tag_range_value(accessibility, target.caret, 0),
+        )
 
     def _frontmost_ax_root(self, accessibility: Any) -> tuple[dict[str, Any], Any]:
         try:
@@ -1736,12 +2503,19 @@ class MacOSComputerUseRuntime:
         requested_window_id = str(params.get("window_id") or "").strip()
         requested_pid = params.get("pid")
         parsed_pid, parsed_bundle, parsed_path = self._parse_ax_window_id(requested_window_id)
+        if requested_window_id and (
+            parsed_path is None
+            or (requested_window_id.startswith("ax-pid:") and parsed_pid is None)
+            or (requested_window_id.startswith("ax-bundle:") and not parsed_bundle)
+        ):
+            raise MacOSComputerUseError("COMPUTER_USE_WINDOW_NOT_FOUND", "Invalid macOS window_id.")
         if requested_pid is None and parsed_pid is not None:
             requested_pid = parsed_pid
 
         candidates = self._ax_window_roots(accessibility)
         for app_info, app_root, window, path in candidates:
             pid_matches = requested_pid is None or str(app_info.get("pid") or "") == str(requested_pid)
+            pid_matches = pid_matches and (parsed_pid is None or str(app_info.get("pid") or "") == str(parsed_pid))
             bundle_matches = not parsed_bundle or str(app_info.get("bundle_id") or "") == parsed_bundle
             path_matches = parsed_path is None or path == parsed_path
             if pid_matches and bundle_matches and path_matches:
@@ -1865,20 +2639,60 @@ class MacOSComputerUseRuntime:
     def _resolve_ax_target(self, accessibility: Any, params: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
         target_value = params.get("target")
         target = dict(target_value) if isinstance(target_value, dict) else {}
-        path = _normalize_ax_path(params.get("path", target.get("path")))
-        _app_info, root = self._frontmost_ax_root(accessibility)
+        path = _normalize_ax_path(params.get("path", target.pop("path", None)))
         screen_size = (0, 0)
         if self._session is not None:
             screen_size = (self._session.session.width, self._session.session.height)
 
-        if path:
-            element = self._ax_element_for_path(accessibility, root, path)
+        scope = {
+            key: str(value).strip().casefold()
+            for key, value in {
+                "pid": params.get("pid"),
+                "name": target.pop("app_name", None),
+                "bundle_id": target.pop("bundle_id", None),
+            }.items()
+            if value is not None and str(value).strip()
+        }
+        window_id = str(params.get("window_id") or "").strip()
+        prefix: list[int] = []
+        if window_id:
+            app_info, root, prefix, _ = self._resolve_ax_window_root(
+                accessibility, params, screen_size=screen_size
+            )
+            candidates = [(app_info, root)]
+        elif scope:
+            candidates = self._ax_application_roots(accessibility)
+        else:
+            candidates = [self._frontmost_ax_root(accessibility)]
+        candidates = [
+            (info, root) for info, root in candidates
+            if all(str(info.get(key, "")).strip().casefold() == value for key, value in scope.items())
+        ]
+        if len(candidates) != 1:
+            raise MacOSComputerUseError(
+                "COMPUTER_USE_AX_TARGET_AMBIGUOUS" if candidates else "COMPUTER_USE_AX_TARGET_NOT_FOUND",
+                "App scope must match exactly one running application; use pid or window_id from list_windows.",
+            )
+        _app_info, root = candidates[0]
+
+        if path or params.get("element_index") is not None:
+            if path[:len(prefix)] != prefix:
+                raise MacOSComputerUseError(
+                    "COMPUTER_USE_ELEMENT_WINDOW_MISMATCH", "Element path is outside the requested window."
+                )
+            element = self._ax_element_for_path(accessibility, root, path[len(prefix):])
             if element is not None:
                 summary = self._ax_target_summary(accessibility, element, path=path, screen_size=screen_size)
                 if self._ax_summary_matches(summary, target, allow_empty=True):
                     return element, summary
 
-        matches = self._find_ax_matches(accessibility, root, target=target, screen_size=screen_size)
+        if params.get("element_index") is not None:
+            raise MacOSComputerUseError(
+                "COMPUTER_USE_AX_TARGET_NOT_FOUND", "Cached element no longer matches; refresh get_window_state."
+            )
+        matches = self._find_ax_matches(
+            accessibility, root, target=target, screen_size=screen_size, path_prefix=prefix
+        )
         if not matches:
             raise MacOSComputerUseError(
                 "COMPUTER_USE_AX_TARGET_NOT_FOUND",
@@ -1904,37 +2718,6 @@ class MacOSComputerUseRuntime:
             element = children[index]
         return element
 
-    def _ax_app_root_for_window_id(self, accessibility: Any, window_id: str) -> tuple[dict[str, Any], Any]:
-        parsed_pid, parsed_bundle, _parsed_path = self._parse_ax_window_id(window_id)
-        candidates = self._ax_application_roots(accessibility)
-        for app_info, app_root in candidates:
-            pid_matches = parsed_pid is None or str(app_info.get("pid") or "") == str(parsed_pid)
-            bundle_matches = not parsed_bundle or str(app_info.get("bundle_id") or "") == parsed_bundle
-            if pid_matches and bundle_matches:
-                return app_info, app_root
-        if not window_id and candidates:
-            return candidates[0][0], candidates[0][1]
-        raise MacOSComputerUseError(
-            "COMPUTER_USE_WINDOW_NOT_FOUND",
-            "No matching macOS Accessibility app/window root was found.",
-        )
-
-    def _ax_element_for_window_path(
-        self,
-        accessibility: Any,
-        *,
-        window_id: str,
-        path: list[int],
-    ) -> tuple[Any, dict[str, Any]]:
-        app_info, app_root = self._ax_app_root_for_window_id(accessibility, window_id)
-        element = self._ax_element_for_path(accessibility, app_root, path)
-        if element is None:
-            raise MacOSComputerUseError(
-                "COMPUTER_USE_AX_TARGET_NOT_FOUND",
-                "No matching macOS Accessibility element was found for the cached path.",
-            )
-        return element, app_info
-
     def _cache_element_indices(self, tree: dict[str, Any], *, window_id: str) -> None:
         self._element_index_cache.clear()
         next_index = 0
@@ -1959,9 +2742,6 @@ class MacOSComputerUseRuntime:
             visit(tree)
 
     def _resolve_element_action_target(self, accessibility: Any, params: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
-        screen_size = (0, 0)
-        if self._session is not None:
-            screen_size = (self._session.session.width, self._session.session.height)
         element_index = params.get("element_index")
         if element_index is not None:
             try:
@@ -1985,28 +2765,12 @@ class MacOSComputerUseRuntime:
                     "element_index belongs to a different cached window_id.",
                 )
             path = _normalize_ax_path(cached.get("path"))
-            element, _app_info = self._ax_element_for_window_path(
-                accessibility,
-                window_id=cached_window_id,
-                path=path,
+            element, summary = self._resolve_ax_target(
+                accessibility, {**params, "window_id": cached_window_id, "path": path}
             )
-            summary = self._ax_target_summary(accessibility, element, path=path, screen_size=screen_size)
             summary["element_index"] = index
             return element, summary
 
-        target_value = params.get("target")
-        target = dict(target_value) if isinstance(target_value, dict) else {}
-        path = _normalize_ax_path(params.get("path", target.get("path")))
-        window_id = str(params.get("window_id") or "").strip()
-        if window_id and path:
-            element, _app_info = self._ax_element_for_window_path(
-                accessibility,
-                window_id=window_id,
-                path=path,
-            )
-            summary = self._ax_target_summary(accessibility, element, path=path, screen_size=screen_size)
-            if self._ax_summary_matches(summary, target, allow_empty=True):
-                return element, summary
         return self._resolve_ax_target(accessibility, params)
 
     def _find_ax_matches(
@@ -2016,6 +2780,7 @@ class MacOSComputerUseRuntime:
         *,
         target: dict[str, Any],
         screen_size: tuple[int, int],
+        path_prefix: list[int] | None = None,
     ) -> list[tuple[int, Any, dict[str, Any]]]:
         if not any(str(target.get(key) or "").strip() for key in ("role", "title", "description", "value", "identifier", "subrole")):
             raise MacOSComputerUseError(
@@ -2023,7 +2788,7 @@ class MacOSComputerUseRuntime:
                 "ax_action requires path or a semantic target.",
             )
         matches: list[tuple[int, Any, dict[str, Any]]] = []
-        queue: list[tuple[Any, list[int], int]] = [(root, [], 0)]
+        queue: list[tuple[Any, list[int], int]] = [(root, path_prefix or [], 0)]
         visited = 0
         while queue and visited < _AX_HARD_MAX_NODES:
             element, path, depth = queue.pop(0)
@@ -2418,6 +3183,7 @@ class MacOSComputerUseRuntime:
         return session
 
     def close(self) -> None:
+        self._tag_target = None
         if self._session is not None and self._session.session.active:
             self.stop_session({"context_id": self._session.session.context_id})
 
@@ -2482,6 +3248,9 @@ def serve_stdio(runtime: MacOSComputerUseRuntime | None = None) -> int:
                         "start_session",
                         "status",
                         "capture",
+                        "tag_context",
+                        "tag_replace",
+                        "tag_release",
                         "list_windows",
                         "get_window_state",
                         "element_action",
@@ -2494,7 +3263,14 @@ def serve_stdio(runtime: MacOSComputerUseRuntime | None = None) -> int:
                         "type",
                         "stop_session",
                     }:
-                        if action not in {"start_session", "status", "stop_session"}:
+                        if action not in {
+                            "start_session",
+                            "status",
+                            "stop_session",
+                            "tag_context",
+                            "tag_replace",
+                            "tag_release",
+                        }:
                             request = normalize_action_payload(
                                 action,
                                 request,
