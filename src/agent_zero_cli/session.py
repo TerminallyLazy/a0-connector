@@ -652,7 +652,6 @@ class ConnectorSession:
         return context_has_messages(metadata)
 
     def _wire_client_callbacks(self, client: A0Client) -> None:
-        client.on_connect = self._handle_connect
         client.on_disconnect = self._handle_disconnect
         client.on_context_snapshot = self._handle_context_snapshot
         client.on_context_event = self._handle_context_event
@@ -667,10 +666,6 @@ class ConnectorSession:
         client.on_browser_op_result_sent = self._handle_tool_result_sent
         client.on_gateway_control = self._handle_gateway_control
         client.on_gateway_control_result_sent = self._handle_gateway_control_result_sent
-
-    def _handle_connect(self) -> None:
-        self.connected = True
-        self._notify_gateway_state_change()
 
     def _handle_disconnect(self) -> None:
         self.connected = False
@@ -1069,6 +1064,8 @@ class ConnectorSession:
                     continue
 
                 self.connected = True
+                if self.gateway_enabled:
+                    await self.refresh_remote_tool_metadata()
                 self.agent_active = False
                 self._context_run_complete = True
                 self._start_remote_tree_publisher()

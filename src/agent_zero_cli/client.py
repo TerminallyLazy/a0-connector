@@ -1669,7 +1669,12 @@ class A0Client:
             payload["remote_exec"] = dict(remote_exec)
         if isinstance(gateway, dict):
             payload["gateway"] = dict(gateway)
-        result = await self._call(_EVENT_HELLO, payload)
+        try:
+            result = await self._call(_EVENT_HELLO, payload)
+        except socketio.exceptions.TimeoutError as exc:
+            raise A0WebSocketConnectionError(
+                "Timed out waiting for Agent Zero to acknowledge the connector handshake."
+            ) from exc
         capabilities = result.get("capabilities")
         if isinstance(capabilities, dict):
             self.peer_ws_max_payload_bytes = _peer_ws_max_payload_bytes(
