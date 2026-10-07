@@ -20,6 +20,7 @@
 - Browser automation against served Textual must target the xterm helper textarea, not normal DOM inputs.
 - Snapshot output defaults to `devtools/snapshots/`, which is generated output.
 - `lock_dependencies.py` uses `uv pip compile` with Python 3.10 as the universal-resolution floor, writes `constraints/a0-runtime.txt` and `constraints/a0-build.txt`, and syncs pinned runtime/build dependencies into `pyproject.toml`.
+- Lock regeneration preserves compatible existing pins; `--upgrade` explicitly refreshes all dependencies. `--check` seeds temporary outputs from the saved locks and checks consistency without changing tracked files.
 
 ## Work Guidance
 
