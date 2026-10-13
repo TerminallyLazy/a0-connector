@@ -1106,6 +1106,7 @@ def test_browser_runtime_endpoint_updates_browser_plugin_config() -> None:
     assert payload["runtime_backend"] == "host_required"
     assert payload["host_browser_profile_mode"] == "existing"
     assert "Browser model-use settings" in payload["privacy_notice"]
+    assert saved[0][3].pop("annotation_screenshots", False) is False
     assert saved == [
         (
             "_browser",
